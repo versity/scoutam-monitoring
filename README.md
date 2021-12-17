@@ -1,0 +1,1 @@
+# scoutam-nagios
