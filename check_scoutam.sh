@@ -53,13 +53,13 @@ do
   fi
 done < <(/sbin/scoutam-monitor -print)
 
-if [[ $(rpm -qa | grep scoutam >/dev/null 2>&1;echo $?) -ne 0 ]]
+if [[ ! -x /sbin/scoutam-monitor || ! -x /bin/samcli || ! -x /sbin/scoutfs ]]
 then
-  echo "UNKNOWN: ScoutAM is not installed"
+  echo "UNKNOWN: ScoutAM and/or ScoutFS not installed"
   exit $NRPE_UNKNOWN
 fi
 
-case $OPERATION in 
+case $OPERATION in
   mount)
     df_warn="${2:-80}"
     df_crit="${3:-95}"
@@ -163,7 +163,7 @@ case $OPERATION in
 
     if [[ $warn -gt 0 ]]
     then
-      echo "WARNING: $warn number of ScoutAM S3 Gateway services are down"
+      echo "WARNING: $warn ScoutAM S3 Gateway services are down"
       exit $NRPE_WARNING
     fi
 
