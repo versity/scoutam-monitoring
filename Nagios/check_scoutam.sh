@@ -27,7 +27,7 @@ function usage {
     echo ""
     echo "check_scoutam.sh [--passfail|-p] operation"
     echo ""
-    echo "    --passfail|-p   Exit with either a 0 (success) or 1 (fail) rather than 1 for warning, or 2 for critical"
+    echo "    --passfail|-p   Exit with either a 0 (success), 0 for warning, or 2 for critical"
     echo ""
     echo "The following check operations are available:"
     echo ""
