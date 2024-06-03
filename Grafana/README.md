@@ -4,6 +4,7 @@ This is a short document describing an example configuration to enable detailed 
 
 The main components and flow of data are shown in the following figure:
 
+```
                           +---------+
                           | Browser |
                           +---------+
@@ -41,6 +42,7 @@ The main components and flow of data are shown in the following figure:
    |   ScoutAM   |       |   ScoutAM   |        |   ScoutAM   |
    |     Node    |       |     Node    |        |    Node     |
    +-------------+       +-------------+        +-------------+
+```
 
 In the above figure, each ScoutAM node running the ScoutAM service is configured to export StatsD metrics to the local node, which also runs the StatsD Exporter provided by Prometheus. Additionally, each node runs the Node Exporter, which Prometheus supplies to export system metrics for components such as network, local disk, CPU, memory, etc.
 
