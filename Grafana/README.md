@@ -172,3 +172,35 @@ ExecStart=/usr/local/bin/node_exporter --collector.textfile.directory=/var/tmp/p
 [Install]
 WantedBy=multi-user.target
 ```
+
+# Grafana Configuration #
+
+The `scoutam_dashboard.json` can be imported into your Grafana dashboard instance. 
+
+## Grafana Variables ##
+
+Several variables are defined in the dashboard to change what is displayed.
+
+### `instance_pattern` ###
+
+You will need to update the dashboard's Settings > Variables settings to update the `instance_pattern` to point to your ScoutAM nodes. The pattern defined in the `instance_pattern` is a custom variable type with a regular expression that matches the nodes in the cluster that you want to visualize.
+
+Example value:
+
+```
+Cluster 1 : s[123]{1}.*, Cluster 2 : s8[123]{1}.*
+```
+
+In the above example, there are two ScoutAM clusters called `Cluster 1` and `Cluster 2` that both include a regular expression that matches the node names included in each cluster.
+
+### `leader` ###
+
+The `leader` variable is used in conjunction with the `instance_pattern` to ensure that you displaying data that the ScoutAM leader/scheduler only displays. This may be updated in the future to automatically change, but for now you when you select an `instance_pattern` for a given ScoutAM cluster, you will also need to change the `leader`.
+
+### `network_pattern` ###
+
+This is variable creates a dropdown of available network interfaces.
+
+### `mdraid_pattern` ###
+
+Since most systems will use MDRAID for ScoutFS devices, you can use this selector to specify which MDRAID devices are shown in the dashboard.
