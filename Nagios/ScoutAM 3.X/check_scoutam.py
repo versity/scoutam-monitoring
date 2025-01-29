@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
+#
+# Copyright 2025 Versity Software, Inc.
+#
+# NRPE Check Script for ScoutAM 3.X
+#
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -336,6 +342,15 @@ def check_gateway(args, gateway="versitygw"):
         name = "ScoutGW"
         conf_dir = SCOUTGW_CONF_DIR
         service_prefix = SCOUTGW_SERVICE
+        if not shutil.which("scoutgw"):
+            nrpe_msgs.append((
+                f"OK: {name} is not installed, skipping check"))
+            return nrpe_status, nrpe_msgs
+    else:
+        if not shutil.which("versitygw"):
+            nrpe_msgs.append((
+                f"OK: {name} is not installed, skipping check"))
+            return nrpe_status, nrpe_msgs
 
     if not os.path.isdir(conf_dir):
         return nrep_status, []
@@ -435,6 +450,14 @@ def main():
         NRPE_EXIT_OK: "ok",
     }
 
+    if not os.path.isfile(SCOUTFS_CMD) and not os.access(SCOUTFS_CMD, os.X_OK):
+        print("CRITICAL: ScoutFS is not installed or missing binaries")
+        sys.exit(NRPE_EXIT_CRIT)
+
+    if not os.path.isfile(SCOUTAM_MONITOR_CMD) and not os.access(SCOUTAM_MONITOR_CMD, os.X_OK):
+        print("CRITICAL: ScoutAM is not installed or missing binaries")
+        sys.exit(NRPE_EXIT_CRIT)
+        
     if args.operation in {"mount", "scoutam", "all"}:
         nrpe_status, msgs = check_mounts(args)
         nrpe_msgs.extend(msgs)
