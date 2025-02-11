@@ -337,6 +337,7 @@ def check_gateway(args, gateway="versitygw"):
     name = "VersityGW"
     conf_dir = VERSITYGW_CONF_DIR
     service_prefix = VERSITYGW_SERVICE
+    configs = []
 
     if gateway == "scoutgw":
         name = "ScoutGW"
