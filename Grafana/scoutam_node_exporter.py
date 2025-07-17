@@ -21,6 +21,23 @@ def is_leader():
         return is_leader.group(1) == 'true'
     return False
 
+def get_filesystems():
+    # Run samcli system and get list of filesystems
+    process = subprocess.Popen(["samcli", "system"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output, _ = process.communicate()
+    output = output.decode('utf-8')
+
+    filesystems = []
+    # Parse FSID lines to get mount points
+    for line in output.split('\n'):
+        if line.startswith('FSID:'):
+            # Format: FSID: /mnt/scoutfs/fs03 (979b51)
+            match = re.match(r'FSID:\s+(\S+)\s+\([a-f0-9]+\)', line)
+            if match:
+                filesystems.append(match.group(1))
+
+    return filesystems
+
 def scheduler_metrics(metrics):
     # Run the command and capture its output
     process = subprocess.Popen(["samcli", "scheduler"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -49,37 +66,50 @@ def scheduler_metrics(metrics):
         else:
             metrics.append('scoutam_scheduler{{queue="{queue}", idle="{idle}"}} 1'.format(queue=queue, idle=idle))
 
-def parse_cache_stats(metrics):
-    # Define regular expressions to match the counts
-    noarchive_pattern = r"NoArchive\s+count:\s+(\d+)\s+data:\d+"
-    unmatched_pattern = r"Archset Unmatched\s+count:\s+(\d+)\s+data:\d+"
+def parse_cache_stats(metrics, mount):
+    # Define regular expressions to match the counts and data sizes
+    noarchive_pattern = r"NoArchive\s+count:\s+(\d+)\s+data:(\d+)"
+    unmatched_pattern = r"Archset Unmatched\s+count:\s+(\d+)\s+data:(\d+)"
+    releasable_pattern = r"Releasable\s+count:\s+(\d+)\s+data:(\d+)"
     damaged_pattern = r"Files with damaged copy:\s+(\d+)"
 
     # Run the command and capture its output
-    process = subprocess.Popen(["samcli", "fs", "acct", "--cache"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(["samcli", "fs", "acct", "--cache", "--mount", mount], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, _ = process.communicate()
 
     # Decode the output before searching
     output = output.decode('utf-8')
 
-    # Search for the counts in the output
+    # Search for the counts and data sizes in the output
     noarchive_match = re.search(noarchive_pattern, output)
     unmatched_match = re.search(unmatched_pattern, output)
+    releasable_match = re.search(releasable_pattern, output)
     damaged_match = re.search(damaged_pattern, output)
 
-    # Extract the counts if matches are found
+    # Extract the counts and sizes if matches are found
     noarchive_count = int(noarchive_match.group(1)) if noarchive_match else 0
+    noarchive_size = int(noarchive_match.group(2)) if noarchive_match else 0
     unmatched_count = int(unmatched_match.group(1)) if unmatched_match else 0
+    unmatched_size = int(unmatched_match.group(2)) if unmatched_match else 0
+    releasable_count = int(releasable_match.group(1)) if releasable_match else 0
+    releasable_size = int(releasable_match.group(2)) if releasable_match else 0
     damaged_count = int(damaged_match.group(1)) if damaged_match else 0
 
-    metrics.append('scoutam_acct{{name="noarchive", type="cache", metric="files"}} {}'.format(noarchive_count))
-    metrics.append('scoutam_acct{{name="unmatched", type="cache", metric="files"}} {}'.format(unmatched_count))
-    metrics.append('scoutam_acct{{name="damaged", type="cache", metric="files"}} {}'.format(damaged_count))
+    # Add file count metrics
+    metrics.append('scoutam_acct{{name="noarchive", fs="{fs}", type="cache", metric="files"}} {}'.format(noarchive_count, fs=mount))
+    metrics.append('scoutam_acct{{name="unmatched", fs="{fs}", type="cache", metric="files"}} {}'.format(unmatched_count, fs=mount))
+    metrics.append('scoutam_acct{{name="releasable", fs="{fs}", type="cache", metric="files"}} {}'.format(releasable_count, fs=mount))
+    metrics.append('scoutam_acct{{name="damaged", fs="{fs}", type="cache", metric="files"}} {}'.format(damaged_count, fs=mount))
 
-def acct_metrics(metrics):
+    # Add data size metrics
+    metrics.append('scoutam_acct{{name="noarchive", fs="{fs}", type="cache", metric="size"}} {}'.format(noarchive_size, fs=mount))
+    metrics.append('scoutam_acct{{name="unmatched", fs="{fs}", type="cache", metric="size"}} {}'.format(unmatched_size, fs=mount))
+    metrics.append('scoutam_acct{{name="releasable", fs="{fs}", type="cache", metric="size"}} {}'.format(releasable_size, fs=mount))
+
+def acct_metrics(metrics, projects):
     # Read the contents of /etc/projects and create a dictionary to map project names to IDs
     project_map = {}
-    with open('/etc/projects', 'r') as f:
+    with open(projects, 'r') as f:
         for line in f:
             name, proj_id = line.strip().split(':')
             project_map[proj_id] = name
@@ -91,49 +121,58 @@ def acct_metrics(metrics):
     # Decode the output and parse it
     output = output.decode("utf-8")
     for line in output.split('\n'):
-        if line.startswith('PROJ'):
-            parts = line.split()
-            proj_id = parts[1]
+        parts = line.split()
+        if len(parts) > 0 and parts[1] == 'PROJ':
+            fs = parts[0]
+            proj_id = parts[2]
             name = project_map.get(proj_id, '')
-            onln_files = parts[3]
-            onln_size = parts[5]
-            tot_files = parts[7]
-            tot_size = parts[9]
+            onln_files = parts[4]
+            onln_size = parts[6]
+            tot_files = parts[8]
+            tot_size = parts[10]
 
             # Creating metrics
-            metrics.append('scoutam_acct{{id="{proj_id}", name="{name}", type="project", category="online", metric="files"}} {}'.format(onln_files, proj_id=proj_id, name=name))
-            metrics.append('scoutam_acct{{id="{proj_id}", name="{name}", type="project", category="online", metric="size"}} {}'.format(onln_size, proj_id=proj_id, name=name))
-            metrics.append('scoutam_acct{{id="{proj_id}", name="{name}", type="project", category="total", metric="files"}} {}'.format(tot_files, proj_id=proj_id, name=name))
-            metrics.append('scoutam_acct{{id="{proj_id}", name="{name}", type="project", category="total", metric="size"}} {}'.format(tot_size, proj_id=proj_id, name=name))
+            metrics.append('scoutam_acct{{id="{proj_id}", name="{name}", fs="{fs}", type="project", category="online", metric="files"}} {}'.format(onln_files, proj_id=proj_id, name=name, fs=fs))
+            metrics.append('scoutam_acct{{id="{proj_id}", name="{name}", fs="{fs}", type="project", category="online", metric="size"}} {}'.format(onln_size, proj_id=proj_id, name=name, fs=fs))
+            metrics.append('scoutam_acct{{id="{proj_id}", name="{name}", fs="{fs}", type="project", category="total", metric="files"}} {}'.format(tot_files, proj_id=proj_id, name=name, fs=fs))
+            metrics.append('scoutam_acct{{id="{proj_id}", name="{name}", fs="{fs}", type="project", category="total", metric="size"}} {}'.format(tot_size, proj_id=proj_id, name=name, fs=fs))
 
-def main(metrics_file):
+def main(args):
     leader = False
     metrics = []
 
-    fqdn = socket.getfqdn()
-    hostname = socket.gethostname().split('.')[0]
+    fqdn = socket.gethostname()
+    hostname = fqdn.split('.')[0]
 
     # Only run on the leader node
     if is_leader():
         leader = True
 
     if leader:
-        if os.path.exists("/etc/projects"):
-            acct_metrics(metrics)
-        parse_cache_stats(metrics)
+        if os.path.exists(args.projects):
+            acct_metrics(metrics, args.projects)
+
+        # Get list of filesystems and collect cache stats for each
+        filesystems = get_filesystems()
+        for fs in filesystems:
+            parse_cache_stats(metrics, fs)
+
         scheduler_metrics(metrics)
 
     metrics.append('scoutam_leader{{fqdn="{fqdn}", hostname="{hostname}", leader="{leader}"}} 1'.format(fqdn=fqdn, hostname=hostname, leader=leader))
 
-    # Write metrics to the specified file
-    with open(metrics_file, 'w') as f:
-        f.write('\n'.join(metrics))
-        f.write('\n')
+    # Write metrics to file or STDOUT
+    output = '\n'.join(metrics) + '\n'
+    if args.file:
+        with open(args.file, 'w') as f:
+            f.write(output)
+    else:
+        print(output, end='')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate metrics file")
-    parser.add_argument("--file", help="Path to the metrics file", required=True)
+    parser.add_argument("--file", type=str, help="Path to the metrics file (if not specified, prints to STDOUT)")
+    parser.add_argument("--projects", type=str, default="/etc/scoutam/projects", help="Path to project ID to name mapping (default /etc/scoutam/projects")
     args = parser.parse_args()
 
-    if args.file:
-        main(args.file)
+    main(args)
