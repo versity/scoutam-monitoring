@@ -21,6 +21,32 @@ def is_leader():
         return is_leader.group(1) == 'true'
     return False
 
+def waiters_metrics(mount, metrics):
+    process = subprocess.Popen(["scoutfs", "data-waiting", "--inode", "0", "--block", "0", "-p", mount], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    output, _ = process.communicate()
+    output = output.decode('utf-8')
+
+    fqdn = socket.gethostname()
+    hostname = fqdn.split('.')[0]
+
+    read_waiters = 0
+    write_waiters = 0
+    change_size_waiters = 0
+
+    for line in output.split('\n'):
+        match = re.match(r'^ino\s+(\d+)\s+iblock\s+(\d+)\s+ops\s+(\S+)', line)
+        if match:
+            if match.group(3) == "read":
+                read_waiters += 1
+            elif match.group(3) == "write":
+                write_waiters += 1
+            elif match.group(3) == "change_size":
+                change_size_waiters += 1
+
+    metrics.append('scoutfs_waiters{{fqdn="{fqdn}", hostname="{hostname}", mount="{mount}", type="read"}} {waiters}'.format(fqdn=fqdn, hostname=hostname, mount=mount, waiters=read_waiters))
+    metrics.append('scoutfs_waiters{{fqdn="{fqdn}", hostname="{hostname}", mount="{mount}", type="write"}} {waiters}'.format(fqdn=fqdn, hostname=hostname, mount=mount, waiters=write_waiters))
+    metrics.append('scoutfs_waiters{{fqdn="{fqdn}", hostname="{hostname}", mount="{mount}", type="change_size"}} {waiters}'.format(fqdn=fqdn, hostname=hostname, mount=mount, waiters=change_size_waiters))
+
 def get_filesystems():
     # Run samcli system and get list of filesystems
     process = subprocess.Popen(["samcli", "system"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -144,6 +170,13 @@ def main(args):
     fqdn = socket.gethostname()
     hostname = fqdn.split('.')[0]
 
+    # Get list of filesystems and collect cache stats for each
+    filesystems = get_filesystems()
+
+    if args.waiters:
+        for mount in filesystems:
+            waiters_metrics(mount, metrics)
+
     # Only run on the leader node
     if is_leader():
         leader = True
@@ -152,8 +185,6 @@ def main(args):
         if os.path.exists(args.projects):
             acct_metrics(metrics, args.projects)
 
-        # Get list of filesystems and collect cache stats for each
-        filesystems = get_filesystems()
         for fs in filesystems:
             parse_cache_stats(metrics, fs)
 
@@ -173,6 +204,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate metrics file")
     parser.add_argument("--file", type=str, help="Path to the metrics file (if not specified, prints to STDOUT)")
     parser.add_argument("--projects", type=str, default="/etc/scoutam/projects", help="Path to project ID to name mapping (default /etc/scoutam/projects")
+    parser.add_argument("--waiters", action="store_true", help="Capture data waiters")
     args = parser.parse_args()
 
     main(args)
