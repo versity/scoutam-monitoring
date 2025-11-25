@@ -26,11 +26,13 @@ SCOUTAM_SERVICE="scoutam"
 SCOUTFS_FENCED_SERVICE="scoutfs-fenced"
 VERSITYGW_SERVICE="versitygw@"
 SCOUTGW_SERVICE="scoutgw@"
+SCOUTSYNC_SERVICE="scoutsync@"
 
 # Configuration locations
 VERSITYGW_CONF_DIR="/etc/versitygw.d"
 SCOUTGW_CONF_DIR="/etc/scoutgw.d"
 MULTIFS_CONF="/etc/scoutam/multifs.yaml"
+SCOUTSYNC_CONF_DIR="/etc/scoutsync.d"
 
 # State file for sequence restart monitoring
 STATE_FILE="/var/lib/nagios/check_scoutam_sequences.json"
@@ -526,6 +528,57 @@ def check_gateway(args, gateway="versitygw"):
 
     return nrpe_status, nrpe_msgs
 
+def check_scoutsync(args):
+    nrpe_status = NRPE_EXIT_OK  
+    nrpe_msgs = []              
+    name = "scoutsync"          
+    conf_dir = SCOUTSYNC_CONF_DIR
+    service_prefix = SCOUTSYNC_SERVICE
+    configs = []                
+                                
+    if not shutil.which("scoutsync"):
+        nrpe_msgs.append((  
+            f"OK: {name} is not installed, skipping check"))
+        return nrpe_status, nrpe_msgs
+                                
+    if not os.path.isdir(conf_dir):
+        return nrpe_status, []  
+                                
+    try:                        
+        configs = [f for f in os.listdir(conf_dir)
+            if f.endswith('.conf')]
+    except Exception as e:      
+        nrpe_msgs.append((      
+            f"CRITICAL: {name} cannot access configuration directory ",
+            f"{conf_dir}: {e}"  
+        ))                      
+                                
+    if not configs:             
+        nrpe_msgs.append(       
+            f"WARN: No {name} configurations found in {conf_dir}"
+        )                       
+                                
+    for conf in configs:        
+        # Skip example configuration file
+        if conf.startswith("example"):
+            continue            
+                                
+        base = os.path.splitext(conf)[0]
+        service = f"{service_prefix}{base}"
+                                
+        status = get_service_status(service)
+        if status != "active":  
+            nrpe_msgs.append(   
+                f"CRITICAL: {name} instance {base} is not running"
+            )                   
+            nrpe_status = NRPE_EXIT_CRIT
+        else:                   
+            nrpe_msgs.append(   
+                f"OK: {name} instance {base} is running"
+            )                   
+                                
+    return nrpe_status, nrpe_msgs
+
 # Check ScoutAM service
 def check_scoutam(args):
     nrpe_status = NRPE_EXIT_OK
@@ -761,6 +814,7 @@ def parse_args():
             "    sequences   - check if Arfind/Stfind restart are blocked (requires threshold args)\n"
             "    gateway     - check if all the configured ScoutAM S3 gateway services are running\n"
             "    versitygw   - check if all the configured Versity S3 gateway services are running\n"
+            "    scoutsync   - check if all the configured ScoutAM Sync services are running\n"
             "    scoutam     - check mount, scoutam, and scheduler\n"
             "    all         - check all including S3 gateways\n"
             "\n"
@@ -776,7 +830,7 @@ def parse_args():
     parser.add_argument("--arfind-crit", type=int, default=600, help="Arfind critical threshold in seconds (default: 600)")
     parser.add_argument("--stfind-warn", type=int, default=300, help="Stfind warning threshold in seconds (default: 300)")
     parser.add_argument("--stfind-crit", type=int, default=600, help="Stfind critical threshold in seconds (default: 600)")
-    parser.add_argument("operation", choices=["mount", "service", "scheduler", "sequences", "gateway", "versitygw", "scoutam", "all"])
+    parser.add_argument("operation", choices=["mount", "service", "scheduler", "sequences", "gateway", "versitygw", "scoutam", "scoutsync", "all"])
     parser.add_argument("crit_thresh", type=int, nargs="?", default=90)
     parser.add_argument("warn_thresh", type=int, nargs="?", default=70)
 
@@ -806,7 +860,7 @@ def main():
     if not os.path.isfile(SCOUTAM_MONITOR_CMD) and not os.access(SCOUTAM_MONITOR_CMD, os.X_OK):
         print("CRITICAL: ScoutAM is not installed or missing binaries")
         sys.exit(NRPE_EXIT_CRIT)
-
+        
     if args.operation in {"mount", "scoutam", "all"}:
         nrpe_status, msgs = check_mounts(args)
         nrpe_msgs.extend(msgs)
@@ -832,8 +886,8 @@ def main():
         nrpe_msgs.extend(msgs)
         nrpe_checks[status_map[nrpe_status]] += 1
 
-    if args.operation in {"versitygw", "all"}:
-        nrpe_status, msgs = check_gateway(args)
+    if args.operation in {"scoutsync", "all"}:
+        nrpe_status, msgs = check_scoutsync(args)
         nrpe_msgs.extend(msgs)
         nrpe_checks[status_map[nrpe_status]] += 1
 
