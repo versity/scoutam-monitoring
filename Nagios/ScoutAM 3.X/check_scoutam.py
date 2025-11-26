@@ -876,7 +876,7 @@ def main():
         nrpe_msgs.extend(msgs)
         nrpe_checks[status_map[nrpe_status]] += 1
 
-    if args.operation == "sequences":
+    if args.operation in {"sequences", "all"}:
         nrpe_status, msgs = check_sequences(args)
         nrpe_msgs.extend(msgs)
         nrpe_checks[status_map[nrpe_status]] += 1
