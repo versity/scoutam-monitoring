@@ -5,9 +5,12 @@
 # NRPE Check Script for ScoutAM 3.X
 #
 
+from __future__ import annotations
+
 import argparse
 import fcntl
 import json
+import logging
 import os
 import re
 import shutil
@@ -15,6 +18,10 @@ import socket
 import subprocess
 import sys
 import time
+from collections import defaultdict
+
+# Configure logging - level set in main() based on --verbose/--debug flags
+logger = logging.getLogger(__name__)
 
 # ScoutAM executables
 SCOUTFS_CMD = "/usr/sbin/scoutfs"
@@ -34,25 +41,16 @@ SCOUTGW_CONF_DIR="/etc/scoutgw.d"
 MULTIFS_CONF="/etc/scoutam/multifs.yaml"
 SCOUTSYNC_CONF_DIR="/etc/scoutsync.d"
 
-# State file for sequence restart monitoring
-STATE_FILE="/var/lib/nagios/check_scoutam_sequences.json"
+# Default state file directory for sequence/resource monitoring
+DEFAULT_STATE_DIR = "/var/lib/nagios"
 
 # NRPE exit status
 NRPE_EXIT_OK = 0
 NRPE_EXIT_WARN = 1
 NRPE_EXIT_CRIT = 2
 
-# Debug/verbose mode flags
-DEBUG = False
-VERBOSE = False
-
-def debug_print(message, level="DEBUG"):
-    """Print debug/verbose messages if enabled."""
-    global DEBUG, VERBOSE
-    if level == "DEBUG" and DEBUG:
-        print(f"[DEBUG] {message}", file=sys.stderr)
-    elif level == "VERBOSE" and (VERBOSE or DEBUG):
-        print(f"[VERBOSE] {message}", file=sys.stderr)
+# Default command timeout (can be overridden via --check-timeout)
+CMD_TIMEOUT = 30
 
 def convert_bytes(size_str):
     unit_multipliers = {
@@ -90,8 +88,21 @@ def b2h(b):
 
     return f"{value:.2f} {units[index]}"
 
-def cmd(command, timeout=30):
-    debug_print(f"Executing command: {command}", "DEBUG")
+def parse_time_duration(value):
+    """Parse time duration string (e.g., '10m', '1h', '600') to seconds."""
+    if isinstance(value, int):
+        return value
+    match = re.match(r'^(\d+)([smh])?$', str(value).lower())
+    if not match:
+        raise ValueError(f"Invalid time format: {value}")
+    num, unit = match.groups()
+    multipliers = {'s': 1, 'm': 60, 'h': 3600, None: 1}
+    return int(num) * multipliers[unit]
+
+def cmd(command: list[str] | str, timeout: int | None = None) -> tuple[list[str] | None, list[str], int]:
+    if timeout is None:
+        timeout = CMD_TIMEOUT
+    logger.debug(f"Executing command: {command}")
     try:
         result = subprocess.run(
             command,
@@ -104,17 +115,17 @@ def cmd(command, timeout=30):
         )
 
         stdout = result.stdout.splitlines()
-        debug_print(f"Command completed successfully, return code: {result.returncode}", "DEBUG")
+        logger.debug(f"Command completed successfully, return code: {result.returncode}")
         if stdout and len(stdout) > 0:
             preview = stdout[0] if len(stdout[0]) <= 100 else stdout[0][:100] + "..."
-            debug_print(f"Output preview (first line): {preview}", "DEBUG")
+            logger.debug(f"Output preview (first line): {preview}")
         return None, stdout, result.returncode
     except subprocess.TimeoutExpired as e:
         error_msg = f"Command timed out after {timeout} seconds"
-        debug_print(f"Command timeout: {error_msg}", "DEBUG")
+        logger.debug(f"Command timeout: {error_msg}")
         return [error_msg], [], -1
     except subprocess.CalledProcessError as e:
-        debug_print(f"Command failed with return code: {e.returncode}", "DEBUG")
+        logger.debug(f"Command failed with return code: {e.returncode}")
         stderr = e.stderr.splitlines() if e.stderr else []
         return stderr, [], e.returncode
 
@@ -221,13 +232,8 @@ def get_service_status(service):
 
     return state
 
-def is_scheduler_node():
-    """
-    Check if the current node is the active scheduler node.
-
-    Returns:
-        tuple: (is_scheduler: bool, scheduler_name: str or None, error: str or None)
-    """
+def is_scheduler_node() -> tuple[bool, str | None, str | None]:
+    """Check if the current node is the active scheduler node."""
     # Execute samcli system command
     command = [SAMCLI_CMD, "system"]
     error, stdout, ret = cmd(command)
@@ -247,12 +253,12 @@ def is_scheduler_node():
         return False, None, "Could not parse scheduler name from samcli system output"
 
     scheduler_name = match.group(1).strip()
-    debug_print(f"Parsed scheduler name from samcli system: {scheduler_name}", "VERBOSE")
+    logger.info(f"Parsed scheduler name from samcli system: {scheduler_name}")
 
     # Get current hostname
     try:
         current_hostname = socket.gethostname()
-        debug_print(f"Current hostname: {current_hostname}", "VERBOSE")
+        logger.info(f"Current hostname: {current_hostname}")
     except Exception as e:
         return False, scheduler_name, f"Could not get current hostname: {e}"
 
@@ -260,20 +266,20 @@ def is_scheduler_node():
     # Extract short name (before first dot) for both
     scheduler_short = scheduler_name.split('.')[0]
     current_short = current_hostname.split('.')[0]
-    debug_print(f"Comparing short names: scheduler='{scheduler_short}' current='{current_short}'", "VERBOSE")
+    logger.info(f"Comparing short names: scheduler='{scheduler_short}' current='{current_short}'")
 
     is_scheduler = (scheduler_short.lower() == current_short.lower())
-    debug_print(f"Is this the scheduler node? {is_scheduler}", "VERBOSE")
+    logger.info(f"Is this the scheduler node? {is_scheduler}")
 
     return is_scheduler, scheduler_name, None
 
-def load_sequence_state():
+def load_state_file(state_file: str) -> dict:
     """Load persisted state from JSON file with file locking, return empty dict if missing or corrupt."""
-    if not os.path.exists(STATE_FILE):
+    if not os.path.exists(state_file):
         return {}
 
     try:
-        with open(STATE_FILE, 'r') as f:
+        with open(state_file, 'r') as f:
             # Acquire shared lock for reading
             fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             try:
@@ -284,13 +290,13 @@ def load_sequence_state():
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except (json.JSONDecodeError, IOError) as e:
         # If file is corrupt or unreadable, log warning and return empty state
-        print(f"WARN: State file corrupt or unreadable, resetting: {e}", file=sys.stderr)
+        print(f"WARN: State file {state_file} corrupt or unreadable, resetting: {e}", file=sys.stderr)
         return {}
 
-def save_sequence_state(state):
+def save_state_file(state: dict, state_file: str) -> None:
     """Save state dict to JSON file with atomic write and file locking."""
     # Ensure directory exists with secure permissions
-    state_dir = os.path.dirname(STATE_FILE)
+    state_dir = os.path.dirname(state_file)
     if state_dir and not os.path.exists(state_dir):
         try:
             os.makedirs(state_dir, mode=0o750)
@@ -299,7 +305,7 @@ def save_sequence_state(state):
             return
 
     # Write to temporary file and rename for atomicity
-    temp_file = STATE_FILE + ".tmp"
+    temp_file = state_file + ".tmp"
     try:
         with open(temp_file, 'w') as f:
             # Acquire exclusive lock for writing
@@ -312,9 +318,9 @@ def save_sequence_state(state):
 
         # Set secure permissions before rename
         os.chmod(temp_file, 0o640)
-        os.rename(temp_file, STATE_FILE)
+        os.rename(temp_file, state_file)
     except (IOError, OSError) as e:
-        print(f"WARN: Could not save state file {STATE_FILE}: {e}", file=sys.stderr)
+        print(f"WARN: Could not save state file {state_file}: {e}", file=sys.stderr)
         # Clean up temp file if it exists
         if os.path.exists(temp_file):
             try:
@@ -322,8 +328,215 @@ def save_sequence_state(state):
             except OSError:
                 pass
 
+def count_flaps(history, flap_window, current_time):
+    """Count state transitions within the time window."""
+    window_start = current_time - flap_window
+    recent = [h for h in history if h["timestamp"] >= window_start]
+
+    transitions = 0
+    for i in range(1, len(recent)):
+        if recent[i]["state"] != recent[i-1]["state"]:
+            transitions += 1
+    return transitions
+
+# Check the state of resources
+def check_resources(args: argparse.Namespace) -> tuple[int, list]:
+    logger.info("Starting resource check")
+    nrpe_status = NRPE_EXIT_OK
+    nrpe_msgs = []
+    current_time = time.time()
+
+    # Compute state file path from --state-dir
+    resources_file = os.path.join(args.state_dir, "resources.json")
+
+    # Check if this is the scheduler node
+    is_scheduler, scheduler_name, error = is_scheduler_node()
+
+    if error:
+        logger.info(f"Error determining scheduler node: {error}")
+        nrpe_msgs.append(f"WARN: Could not determine scheduler node: {error}")
+        return NRPE_EXIT_WARN, nrpe_msgs
+
+    if not is_scheduler:
+        logger.info(f"Not scheduler node (scheduler is {scheduler_name}), skipping resource check")
+        # Remove state file if it exists (it's outdated if node becomes scheduler later)
+        if os.path.exists(resources_file):
+            try:
+                os.unlink(resources_file)
+                logger.info("Removed stale resources state file")
+            except OSError as e:
+                logger.info(f"Could not remove stale resources state file: {e}")
+        nrpe_msgs.append(f"OK: Not scheduler node, skipping resource check (scheduler: {scheduler_name})")
+        return NRPE_EXIT_OK, nrpe_msgs
+
+    # Parse flap detection parameters
+    try:
+        flap_window = parse_time_duration(args.flap_window)
+    except ValueError as e:
+        nrpe_msgs.append(f"CRITICAL: Invalid flap-window value: {e}")
+        return NRPE_EXIT_CRIT, nrpe_msgs
+
+    flap_count = args.flap_count
+
+    # Load previous state (only on scheduler node)
+    state = load_state_file(resources_file) if is_scheduler else {}
+    logger.info(f"Loaded state for {len(state)} resource(s)")
+
+    command = [SAMCLI_CMD, "resource"]
+    error, stdout, ret = cmd(command)
+    if ret != 0:
+        nrpe_msgs.append(
+            f"CRITICAL: ScoutAM resource check failed: {error}"
+        )
+        return NRPE_EXIT_CRIT, nrpe_msgs
+
+    resources = {}
+    # Track state counts per domain per kind: domain_counts[domain][kind][state] = count
+    domain_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    totals = defaultdict(int)
+    seen_resource_ids = set()
+
+    # Pattern: ID  Kind  Name  Domain  State  Nodes
+    # Columns are separated by 2+ spaces; Kind can contain single spaces
+    resource_regex = re.compile(
+        r'^(\d+)\s{2,}'        # ID followed by 2+ spaces
+        r'(.+?)\s{2,}'         # Kind (non-greedy, can have single space)
+        r'(\S+)\s{2,}'         # Name
+        r'(\S+)\s{2,}'         # Domain
+        r'(\S+)'               # State
+        r'(?:\s+(.+))?$'       # Optional: spaces followed by Nodes
+    )
+
+    for line in stdout:
+        line = line.strip()
+
+        # skip comments, headers, blank lines
+        if not line or line.startswith('#') or line.startswith('ID'):
+            continue
+
+        # Try tab-separated first (raw output), then space-aligned (tabwriter)
+        parts = line.split('\t')
+        if len(parts) == 6:
+            rid, kind, name, domain, current_state, nodes = parts
+        else:
+            match = resource_regex.match(line)
+            if not match:
+                logger.debug(f"Skipping unmatched line: {line}")
+                continue
+            rid, kind, name, domain, current_state, nodes = match.groups()
+
+        rid = str(rid)  # Use string keys for JSON compatibility
+        seen_resource_ids.add(rid)
+
+        # Track flapping (only on scheduler node)
+        is_flapping = False
+        if is_scheduler:
+            if rid not in state:
+                # New resource - initialize state
+                state[rid] = {
+                    "name": name,
+                    "kind": kind,
+                    "domain": domain,
+                    "current_state": current_state,
+                    "history": [{"state": current_state, "timestamp": current_time}]
+                }
+            else:
+                # Existing resource - check for state change
+                prev_state = state[rid].get("current_state")
+                if prev_state != current_state:
+                    # State changed - append to history
+                    state[rid]["history"].append({
+                        "state": current_state,
+                        "timestamp": current_time
+                    })
+                    logger.info(f"Resource {rid} ({name}) state changed: {prev_state} -> {current_state}")
+
+                state[rid]["current_state"] = current_state
+                state[rid]["name"] = name
+                state[rid]["kind"] = kind
+                state[rid]["domain"] = domain
+
+            # Prune old history entries
+            window_start = current_time - flap_window
+            state[rid]["history"] = [
+                h for h in state[rid]["history"]
+                if h["timestamp"] >= window_start
+            ]
+
+            # Check if flapping
+            flaps = count_flaps(state[rid]["history"], flap_window, current_time)
+            if flaps >= flap_count:
+                is_flapping = True
+                logger.info(f"Resource {rid} ({name}) is flapping: {flaps} transitions in {flap_window}s")
+
+        resources[rid] = {
+            'kind': kind,
+            'name': name,
+            'domain': domain,
+            'state': current_state,
+            'nodes': [n.strip() for n in nodes.split(',')] if nodes else [],
+            'flapping': is_flapping
+        }
+
+        domain_counts[domain][kind][current_state] += 1
+        if is_flapping:
+            domain_counts[domain][kind]["FLAPPING"] += 1
+        totals[current_state] += 1
+
+    # Clean up stale entries from state (resources no longer present)
+    if is_scheduler:
+        stale_ids = [rid for rid in state.keys() if rid not in seen_resource_ids]
+        for rid in stale_ids:
+            del state[rid]
+
+        # Save updated state
+        save_state_file(state, resources_file)
+
+    # Report each domain with its status
+    nrpe_status = NRPE_EXIT_OK
+
+    for domain in sorted(domain_counts.keys()):
+        kinds = domain_counts[domain]
+
+        # Aggregate states across all kinds for this domain
+        domain_error = 0
+        domain_down = 0
+        domain_off = 0
+        domain_flapping = 0
+
+        # Build summary per kind
+        kind_parts = []
+        for kind in sorted(kinds.keys()):
+            states = kinds[kind]
+            domain_error += states["error"]
+            domain_down += states["down"]
+            domain_off += states["off"]
+            domain_flapping += states["FLAPPING"]
+
+            # Build state list for this kind (only non-zero states)
+            state_parts = []
+            for state_name, count in sorted(states.items()):
+                if count > 0:
+                    state_parts.append(f"{count} {state_name}")
+
+            if state_parts:
+                kind_parts.append(f"{kind} ({', '.join(state_parts)})")
+
+        kind_summary = ", ".join(kind_parts)
+
+        if domain_error > 0 or domain_down > 0:
+            nrpe_msgs.append(f"CRITICAL: {domain}: {kind_summary}")
+            nrpe_status = max(nrpe_status, NRPE_EXIT_CRIT)
+        elif domain_off > 0 or domain_flapping > 0:
+            nrpe_msgs.append(f"WARN: {domain}: {kind_summary}")
+            nrpe_status = max(nrpe_status, NRPE_EXIT_WARN)
+        else:
+            nrpe_msgs.append(f"OK: {domain}: {kind_summary}")
+
+    return nrpe_status, nrpe_msgs
+
 # Check the state of the scheduler
-def check_scheduler(args):
+def check_scheduler(args: argparse.Namespace) -> tuple[int, list]:
     nrpe_status = NRPE_EXIT_OK
     nrpe_state = "OK"
     nrpe_msgs = []
@@ -370,7 +583,7 @@ def check_scheduler(args):
     return nrpe_status, nrpe_msgs
 
 # Check all things ScoutFS
-def check_mounts(args):
+def check_mounts(args: argparse.Namespace) -> tuple[int, list]:
     nrpe_status = NRPE_EXIT_OK
     nrpe_msgs = []
 
@@ -468,7 +681,7 @@ def check_mounts(args):
 
     return nrpe_status, nrpe_msgs
 
-def check_gateway(args, gateway="versitygw"):
+def check_gateway(args: argparse.Namespace, gateway: str = "versitygw") -> tuple[int, list]:
     nrpe_status = NRPE_EXIT_OK
     nrpe_msgs = []
     name = "VersityGW"
@@ -528,7 +741,7 @@ def check_gateway(args, gateway="versitygw"):
 
     return nrpe_status, nrpe_msgs
 
-def check_scoutsync(args):
+def check_scoutsync(args: argparse.Namespace) -> tuple[int, list]:
     nrpe_status = NRPE_EXIT_OK
     nrpe_msgs = []
     name = "scoutsync"
@@ -580,7 +793,7 @@ def check_scoutsync(args):
     return nrpe_status, nrpe_msgs
 
 # Check ScoutAM service
-def check_scoutam(args):
+def check_scoutam(args: argparse.Namespace) -> tuple[int, list]:
     nrpe_status = NRPE_EXIT_OK
     nrpe_msgs = []
 
@@ -595,30 +808,32 @@ def check_scoutam(args):
     return nrpe_status, nrpe_msgs
 
 # Check sequence restart status for Arfind and Stfind
-def check_sequences(args):
-    debug_print("Starting sequence restart check", "VERBOSE")
+def check_sequences(args: argparse.Namespace) -> tuple[int, list]:
+    logger.info("Starting sequence restart check")
     nrpe_status = NRPE_EXIT_OK
     nrpe_msgs = []
     current_time = time.time()
 
+    # Compute state file path from --state-dir
+    state_file = os.path.join(args.state_dir, "check_scoutam_sequences.json")
+
     # Check if this is the scheduler node
     is_scheduler, scheduler_name, error = is_scheduler_node()
 
-
     if error:
         # Could not determine scheduler status - return warning
-        debug_print(f"Error determining scheduler node: {error}", "VERBOSE")
+        logger.info(f"Error determining scheduler node: {error}")
         nrpe_msgs.append(f"WARN: Could not determine scheduler node: {error}")
         return NRPE_EXIT_WARN, nrpe_msgs
 
     if not is_scheduler:
         # Not the scheduler node - skip check with OK status
-        debug_print(f"Not scheduler node (scheduler is {scheduler_name}), skipping check", "VERBOSE")
+        logger.info(f"Not scheduler node (scheduler is {scheduler_name}), skipping check")
         # Remove state file if it exists (it's outdated if node becomes scheduler later)
-        if os.path.exists(STATE_FILE):
+        if os.path.exists(state_file):
             try:
-                os.unlink(STATE_FILE)
-                debug_print("Removed stale state file", "VERBOSE")
+                os.unlink(state_file)
+                logger.info("Removed stale state file")
                 nrpe_msgs.append(f"OK: Not scheduler node, skipping sequence check (scheduler: {scheduler_name}), removed stale state file")
             except OSError as e:
                 # Failed to remove state file - warn but don't fail the check
@@ -655,8 +870,8 @@ def check_sequences(args):
     current_seq_regex = re.compile(r'Current FS Seq:\s*(\d+)')
 
     # Load previous state
-    state = load_sequence_state()
-    debug_print(f"Loaded state for {len(state)} filesystem(s)", "VERBOSE")
+    state = load_state_file(state_file)
+    logger.info(f"Loaded state for {len(state)} filesystem(s)")
 
     # Track which mounts we've seen (to clean up stale entries)
     seen_mounts = set()
@@ -668,7 +883,7 @@ def check_sequences(args):
         fsid = fs_match.group("fsid")
         mount = fs_match.group("mount").strip()
         content = fs_match.group("content")
-        debug_print(f"Processing filesystem {mount} (FSID: {fsid})", "VERBOSE")
+        logger.info(f"Processing filesystem {mount} (FSID: {fsid})")
 
         # Filter by mount if specified
         if args.mount and mount != args.mount:
@@ -791,7 +1006,7 @@ def check_sequences(args):
         del state[mnt]
 
     # Save updated state
-    save_sequence_state(state)
+    save_state_file(state, state_file)
 
     return nrpe_status, nrpe_msgs
 
@@ -811,8 +1026,8 @@ def parse_args():
             "\n"
             "    mount [warn_thresh] [crit_thresh] - check if scoutfs filesystem is mounted\n"
             "    service     - check if the ScoutAM service is running\n"
-            "    scheduler   - check if the scheduler is running on the leader node\n"
             "    sequences   - check if Arfind/Stfind restart are blocked (requires threshold args)\n"
+            "    resources   - check the state of resources in the system\n"
             "    gateway     - check if all the configured ScoutAM S3 gateway services are running\n"
             "    versitygw   - check if all the configured Versity S3 gateway services are running\n"
             "    scoutsync   - check if all the configured ScoutAM Sync services are running\n"
@@ -831,7 +1046,13 @@ def parse_args():
     parser.add_argument("--arfind-crit", type=int, default=600, help="Arfind critical threshold in seconds (default: 600)")
     parser.add_argument("--stfind-warn", type=int, default=300, help="Stfind warning threshold in seconds (default: 300)")
     parser.add_argument("--stfind-crit", type=int, default=600, help="Stfind critical threshold in seconds (default: 600)")
-    parser.add_argument("operation", choices=["mount", "service", "scheduler", "sequences", "gateway", "versitygw", "scoutam", "scoutsync", "all"])
+    parser.add_argument("--flap-count", type=int, default=3, help="Number of state changes to trigger flap warning (default: 3)")
+    parser.add_argument("--flap-window", type=str, default="10m", help="Time window for flap detection, e.g., 10m, 30m, 1h (default: 10m)")
+    parser.add_argument("--state-dir", type=str, default=DEFAULT_STATE_DIR, help=f"Directory for state files (default: {DEFAULT_STATE_DIR})")
+    parser.add_argument("--check-timeout", type=int, default=30, help="Timeout per command in seconds (default: 30)")
+    parser.add_argument("--zabbix", action="store_true", help="Zabbix mode: always exit 0, status in output text")
+    parser.add_argument("--json", action="store_true", help="Output JSON format for Zabbix dependent items")
+    parser.add_argument("operation", choices=["mount", "service", "scheduler", "sequences", "gateway", "versitygw", "resources", "scoutam", "scoutsync", "all"])
     parser.add_argument("crit_thresh", type=int, nargs="?", default=90)
     parser.add_argument("warn_thresh", type=int, nargs="?", default=70)
 
@@ -840,19 +1061,38 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Set global debug/verbose flags
-    global DEBUG, VERBOSE
-    DEBUG = args.debug
-    VERBOSE = args.verbose
+    # Configure logging based on --verbose/--debug flags
+    if args.debug:
+        log_level = logging.DEBUG
+    elif args.verbose:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
+    logging.basicConfig(level=log_level, format='[%(levelname)s] %(message)s', stream=sys.stderr)
+
+    # Set global command timeout
+    global CMD_TIMEOUT
+    CMD_TIMEOUT = args.check_timeout
 
     nrpe_msgs = []
     nrpe_checks = {"ok": 0, "warn": 0, "crit": 0}
+    check_results = []  # For JSON output
 
     status_map = {
         NRPE_EXIT_CRIT: "crit",
         NRPE_EXIT_WARN: "warn",
         NRPE_EXIT_OK: "ok",
     }
+
+    status_text_map = {
+        NRPE_EXIT_OK: "OK",
+        NRPE_EXIT_WARN: "WARNING",
+        NRPE_EXIT_CRIT: "CRITICAL",
+    }
+
+    def format_messages(msgs):
+        """Convert message list (may contain tuples) to list of strings."""
+        return [m if isinstance(m, str) else "".join(m) for m in msgs]
 
     if not os.path.isfile(SCOUTFS_CMD) and not os.access(SCOUTFS_CMD, os.X_OK):
         print("CRITICAL: ScoutFS is not installed or missing binaries")
@@ -862,41 +1102,50 @@ def main():
         print("CRITICAL: ScoutAM is not installed or missing binaries")
         sys.exit(NRPE_EXIT_CRIT)
 
-    if args.operation in {"mount", "scoutam", "all"}:
-        nrpe_status, msgs = check_mounts(args)
-        nrpe_msgs.extend(msgs)
-        nrpe_checks[status_map[nrpe_status]] += 1
+    # Check dispatch table: (operation, result_name, check_function, groups)
+    # Groups define which aggregate operations include this check
+    CHECKS = [
+        ("mount",     "mounts",    check_mounts,                          {"scoutam", "all"}),
+        ("service",   "service",   check_scoutam,                         {"scoutam", "all"}),
+        ("scheduler", "scheduler", check_scheduler,                       {"scoutam", "all"}),
+        ("sequences", "sequences", check_sequences,                       {"all"}),
+        ("gateway",   "gateway",   lambda a: check_gateway(a, "scoutgw"), {"all"}),
+        ("versitygw", "versitygw", lambda a: check_gateway(a, "versitygw"), {"all"}),
+        ("scoutsync", "scoutsync", check_scoutsync,                       {"all"}),
+        ("resources", "resources", check_resources,                       {"all"}),
+    ]
 
-    if args.operation in {"service", "scoutam", "all"}:
-        nrpe_status, msgs = check_scoutam(args)
-        nrpe_msgs.extend(msgs)
-        nrpe_checks[status_map[nrpe_status]] += 1
+    for op, name, func, groups in CHECKS:
+        if args.operation == op or args.operation in groups:
+            nrpe_status, msgs = func(args)
+            nrpe_msgs.extend(msgs)
+            nrpe_checks[status_map[nrpe_status]] += 1
+            check_results.append({
+                "name": name,
+                "status": nrpe_status,
+                "status_text": status_text_map[nrpe_status],
+                "messages": format_messages(msgs)
+            })
 
-    if args.operation in {"scheduler", "scoutam", "all"}:
-        nrpe_status, msgs = check_scheduler(args)
-        nrpe_msgs.extend(msgs)
-        nrpe_checks[status_map[nrpe_status]] += 1
+    # Determine overall status
+    if nrpe_checks['crit'] > 0:
+        overall_status = NRPE_EXIT_CRIT
+    elif nrpe_checks['warn'] > 0:
+        overall_status = NRPE_EXIT_WARN
+    else:
+        overall_status = NRPE_EXIT_OK
 
-    if args.operation in {"sequences", "all"}:
-        nrpe_status, msgs = check_sequences(args)
-        nrpe_msgs.extend(msgs)
-        nrpe_checks[status_map[nrpe_status]] += 1
+    # JSON output mode
+    if args.json:
+        output = {
+            "status": overall_status,
+            "status_text": status_text_map[overall_status],
+            "checks": check_results
+        }
+        print(json.dumps(output))
+        sys.exit(0)  # Always exit 0 for Zabbix
 
-    if args.operation in {"gateway", "all"}:
-        nrpe_status, msgs = check_gateway(args, "scoutgw")
-        nrpe_msgs.extend(msgs)
-        nrpe_checks[status_map[nrpe_status]] += 1
-
-    if args.operation in {"versitygw", "all"}:
-        nrpe_status, msgs = check_gateway(args, "versitygw")
-        nrpe_msgs.extend(msgs)
-        nrpe_checks[status_map[nrpe_status]] += 1
-
-    if args.operation in {"scoutsync", "all"}:
-        nrpe_status, msgs = check_scoutsync(args)
-        nrpe_msgs.extend(msgs)
-        nrpe_checks[status_map[nrpe_status]] += 1
-
+    # Standard text output
     if not args.passfail:
         for line in nrpe_msgs:
             if isinstance(line, tuple):
@@ -904,12 +1153,11 @@ def main():
             else:
                 print(line)
 
-    if nrpe_checks['crit'] > 0:
-        sys.exit(NRPE_EXIT_CRIT)
-    elif nrpe_checks['warn'] > 0:
-        sys.exit(NRPE_EXIT_WARN)
+    # Zabbix text mode: always exit 0, status is in text output
+    if args.zabbix:
+        sys.exit(0)
 
-    sys.exit(NRPE_EXIT_OK)
+    sys.exit(overall_status)
 
 if __name__ == "__main__":
     main()
