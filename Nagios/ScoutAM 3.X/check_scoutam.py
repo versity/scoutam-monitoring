@@ -529,54 +529,54 @@ def check_gateway(args, gateway="versitygw"):
     return nrpe_status, nrpe_msgs
 
 def check_scoutsync(args):
-    nrpe_status = NRPE_EXIT_OK  
-    nrpe_msgs = []              
-    name = "scoutsync"          
+    nrpe_status = NRPE_EXIT_OK
+    nrpe_msgs = []
+    name = "scoutsync"
     conf_dir = SCOUTSYNC_CONF_DIR
     service_prefix = SCOUTSYNC_SERVICE
-    configs = []                
-                                
+    configs = []
+
     if not shutil.which("scoutsync"):
-        nrpe_msgs.append((  
+        nrpe_msgs.append((
             f"OK: {name} is not installed, skipping check"))
         return nrpe_status, nrpe_msgs
-                                
+
     if not os.path.isdir(conf_dir):
-        return nrpe_status, []  
-                                
-    try:                        
+        return nrpe_status, []
+
+    try:
         configs = [f for f in os.listdir(conf_dir)
             if f.endswith('.conf')]
-    except Exception as e:      
-        nrpe_msgs.append((      
+    except Exception as e:
+        nrpe_msgs.append((
             f"CRITICAL: {name} cannot access configuration directory ",
-            f"{conf_dir}: {e}"  
-        ))                      
-                                
-    if not configs:             
-        nrpe_msgs.append(       
+            f"{conf_dir}: {e}"
+        ))
+
+    if not configs:
+        nrpe_msgs.append(
             f"WARN: No {name} configurations found in {conf_dir}"
-        )                       
-                                
-    for conf in configs:        
+        )
+
+    for conf in configs:
         # Skip example configuration file
         if conf.startswith("example"):
-            continue            
-                                
+            continue
+
         base = os.path.splitext(conf)[0]
         service = f"{service_prefix}{base}"
-                                
+
         status = get_service_status(service)
-        if status != "active":  
-            nrpe_msgs.append(   
+        if status != "active":
+            nrpe_msgs.append(
                 f"CRITICAL: {name} instance {base} is not running"
-            )                   
+            )
             nrpe_status = NRPE_EXIT_CRIT
-        else:                   
-            nrpe_msgs.append(   
+        else:
+            nrpe_msgs.append(
                 f"OK: {name} instance {base} is running"
-            )                   
-                                
+            )
+
     return nrpe_status, nrpe_msgs
 
 # Check ScoutAM service
@@ -603,6 +603,7 @@ def check_sequences(args):
 
     # Check if this is the scheduler node
     is_scheduler, scheduler_name, error = is_scheduler_node()
+
 
     if error:
         # Could not determine scheduler status - return warning
@@ -860,7 +861,7 @@ def main():
     if not os.path.isfile(SCOUTAM_MONITOR_CMD) and not os.access(SCOUTAM_MONITOR_CMD, os.X_OK):
         print("CRITICAL: ScoutAM is not installed or missing binaries")
         sys.exit(NRPE_EXIT_CRIT)
-        
+
     if args.operation in {"mount", "scoutam", "all"}:
         nrpe_status, msgs = check_mounts(args)
         nrpe_msgs.extend(msgs)
@@ -883,6 +884,11 @@ def main():
 
     if args.operation in {"gateway", "all"}:
         nrpe_status, msgs = check_gateway(args, "scoutgw")
+        nrpe_msgs.extend(msgs)
+        nrpe_checks[status_map[nrpe_status]] += 1
+
+    if args.operation in {"versitygw", "all"}:
+        nrpe_status, msgs = check_gateway(args, "versitygw")
         nrpe_msgs.extend(msgs)
         nrpe_checks[status_map[nrpe_status]] += 1
 
