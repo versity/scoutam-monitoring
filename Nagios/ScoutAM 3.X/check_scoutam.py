@@ -16,13 +16,16 @@ import subprocess
 import sys
 import time
 
+# Enable or disable ScoutAM notifications from this script.
+SAM_NOTIFY=True
+
+# Command to escalate privileges for samcli usage
+SUDO_CMD = "/bin/sudo"
+
 # ScoutAM executables
 SCOUTFS_CMD = "/usr/sbin/scoutfs"
 SCOUTAM_MONITOR_CMD = "/usr/sbin/scoutam-monitor"
 SAMCLI_CMD = "/usr/bin/samcli"
-
-# Command to escalate privileges for samcli usage
-SUDO_CMD = "/bin/sudo"
 
 # SystemD services
 SCOUTAM_SERVICE = "scoutam"
@@ -43,7 +46,7 @@ STATE_FILE = "/var/lib/nagios/check_scoutam_sequences.json"
 JOBS_STATE_FILE = "/var/lib/nagios/check_scoutam_jobs.json"
 
 # Scheduler queues that indicate a stuck/waiting packet
-STUCK_QUEUE_NAMES = {"PENDING-Q", "WAIT-Q"}
+STUCK_QUEUE_NAMES = {"RUNNING", "RESERVING", PENDING-Q", "WAIT-Q"}
 
 # Date format used by samcli scheduler --detail
 SCHEDULER_DATE_FMT = "%b %d %H:%M:%S %Z %Y"
@@ -351,6 +354,9 @@ def load_jobs_state():
 
 def send_notify(message, severity, timestamp):
     """Send a notification via samcli notify message. Failures are logged as warnings."""
+    if not SAM_NOTIFY:
+        debug_print(f"SAM_NOTIFY disabled, skipping notification (severity {severity}): {message}", "VERBOSE")
+        return
     command = [SUDO_CMD, SAMCLI_CMD, "notify", "message",
                "--message", message,
                "--severity", str(severity),
