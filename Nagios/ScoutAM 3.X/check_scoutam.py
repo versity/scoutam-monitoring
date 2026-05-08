@@ -21,21 +21,32 @@ SCOUTFS_CMD = "/usr/sbin/scoutfs"
 SCOUTAM_MONITOR_CMD = "/usr/sbin/scoutam-monitor"
 SAMCLI_CMD = "/usr/bin/samcli"
 
+# Command to escalate privileges for samcli usage
+SUDO_CMD = "/bin/sudo"
+
 # SystemD services
-SCOUTAM_SERVICE="scoutam"
-SCOUTFS_FENCED_SERVICE="scoutfs-fenced"
-VERSITYGW_SERVICE="versitygw@"
-SCOUTGW_SERVICE="scoutgw@"
-SCOUTSYNC_SERVICE="scoutsync@"
+SCOUTAM_SERVICE = "scoutam"
+SCOUTFS_FENCED_SERVICE = "scoutfs-fenced"
+VERSITYGW_SERVICE = "versitygw@"
+SCOUTGW_SERVICE = "scoutgw@"
+SCOUTSYNC_SERVICE = "scoutsync@"
 
 # Configuration locations
-VERSITYGW_CONF_DIR="/etc/versitygw.d"
-SCOUTGW_CONF_DIR="/etc/scoutgw.d"
-MULTIFS_CONF="/etc/scoutam/multifs.yaml"
-SCOUTSYNC_CONF_DIR="/etc/scoutsync.d"
+VERSITYGW_CONF_DIR = "/etc/versitygw.d"
+SCOUTGW_CONF_DIR = "/etc/scoutgw.d"
+SCOUTSYNC_CONF_DIR = "/etc/scoutsync.d"
 
 # State file for sequence restart monitoring
-STATE_FILE="/var/lib/nagios/check_scoutam_sequences.json"
+STATE_FILE = "/var/lib/nagios/check_scoutam_sequences.json"
+
+# State file for stuck scheduler packet monitoring
+JOBS_STATE_FILE = "/var/lib/nagios/check_scoutam_jobs.json"
+
+# Scheduler queues that indicate a stuck/waiting packet
+STUCK_QUEUE_NAMES = {"PENDING-Q", "WAIT-Q"}
+
+# Date format used by samcli scheduler --detail
+SCHEDULER_DATE_FMT = "%b %d %H:%M:%S %Z %Y"
 
 # NRPE exit status
 NRPE_EXIT_OK = 0
@@ -105,7 +116,7 @@ def cmd(command, timeout=30):
 
         stdout = result.stdout.splitlines()
         debug_print(f"Command completed successfully, return code: {result.returncode}", "DEBUG")
-        if stdout and len(stdout) > 0:
+        if stdout:
             preview = stdout[0] if len(stdout[0]) <= 100 else stdout[0][:100] + "..."
             debug_print(f"Output preview (first line): {preview}", "DEBUG")
         return None, stdout, result.returncode
@@ -176,7 +187,7 @@ def get_usage(mount):
             usage[usage_type]["bytes_free"] = usage[usage_type]["blocks_free"] * usage[usage_type]["block_size"]
 
     # Get high and low watermarks
-    command = [SAMCLI_CMD, "fs", "stat", "-m", mount]
+    command = [SUDO_CMD, SAMCLI_CMD, "fs", "stat", "-m", mount]
     error, stdout, ret = cmd(command)
     if ret != 0:
         return error, None
@@ -229,11 +240,11 @@ def is_scheduler_node():
         tuple: (is_scheduler: bool, scheduler_name: str or None, error: str or None)
     """
     # Execute samcli system command
-    command = [SAMCLI_CMD, "system"]
+    command = [SUDO_CMD, SAMCLI_CMD, "system"]
     error, stdout, ret = cmd(command)
 
     if ret != 0:
-        error_msg = f"Failed to execute samcli system: {error}"
+        error_msg = f"Failed to execute samcli system: {'; '.join(error) if error else 'unknown error'}"
         return False, None, error_msg
 
     # Parse output to find "scheduler name"
@@ -322,18 +333,333 @@ def save_sequence_state(state):
             except OSError:
                 pass
 
+def load_jobs_state():
+    """Load previous jobs state for archset-level notification tracking."""
+    if not os.path.exists(JOBS_STATE_FILE):
+        return {}
+    try:
+        with open(JOBS_STATE_FILE, 'r') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                data = json.load(f)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        return data
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"WARN: Jobs state file unreadable, skipping transition detection: {e}", file=sys.stderr)
+        return {}
+
+def send_notify(message, severity, timestamp):
+    """Send a notification via samcli notify message. Failures are logged as warnings."""
+    command = [SUDO_CMD, SAMCLI_CMD, "notify", "message",
+               "--message", message,
+               "--severity", str(severity),
+               "--timestamp", str(int(timestamp))]
+    error, stdout, ret = cmd(command)
+    if ret != 0:
+        error_str = "; ".join(error) if error else "unknown error"
+        print(f"WARN: Failed to send notification: {error_str}", file=sys.stderr)
+    else:
+        debug_print(f"Notification sent (severity {severity}): {message}", "VERBOSE")
+
+def save_jobs_state(state):
+    """Save job state dict to JSON file with atomic write and file locking."""
+    state_dir = os.path.dirname(JOBS_STATE_FILE)
+    if state_dir and not os.path.exists(state_dir):
+        try:
+            os.makedirs(state_dir, mode=0o750)
+        except OSError as e:
+            print(f"WARN: Could not create state directory {state_dir}: {e}", file=sys.stderr)
+            return
+
+    temp_file = JOBS_STATE_FILE + ".tmp"
+    try:
+        with open(temp_file, 'w') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                json.dump(state, f, indent=2)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        os.chmod(temp_file, 0o640)
+        os.rename(temp_file, JOBS_STATE_FILE)
+    except (IOError, OSError) as e:
+        print(f"WARN: Could not save jobs state file {JOBS_STATE_FILE}: {e}", file=sys.stderr)
+        if os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except OSError:
+                pass
+
+def check_jobs(args):
+    """
+    Check for ScoutAM scheduler packets stuck in non-running queues.
+
+    Parses `samcli scheduler --detail` output. Each packet has a Created
+    timestamp so age is computed directly. A JSON state file is maintained
+    as a live snapshot for external monitoring tools — entries are added or
+    updated each run and removed when packets complete or leave the queue.
+
+    Queues considered stuck: PENDING-Q, WAIT-Q (anything not RUNNING/RESERVING).
+    Reports WARN/CRIT when a packet has been queued beyond the configured thresholds.
+    """
+    debug_print("Starting stuck jobs check", "VERBOSE")
+    nrpe_status = NRPE_EXIT_OK
+    nrpe_msgs = []
+    now = time.time()
+
+    command = [SUDO_CMD, SAMCLI_CMD, "scheduler", "--detail"]
+    error, stdout, ret = cmd(command)
+    if ret != 0:
+        error_str = "; ".join(error) if error else "unknown error"
+        nrpe_msgs.append(f"CRITICAL: Scheduler job check failed: {error_str}")
+        return NRPE_EXIT_CRIT, nrpe_msgs
+
+    warn_secs = args.job_warn * 3600
+    crit_secs = args.job_crit * 3600
+
+    prev_archsets = load_jobs_state().get("archsets", {})
+    packets_snapshot = []
+
+    # Detail output format per queue section:
+    #   <QUEUE_NAME>
+    #   ----------
+    #   ID: <id> TYPE: <type> FSID: <fsid> Archset: <archset>   (or Volume:/Library:)
+    #   Created: Jan 02 15:04:05 MST 2006
+    #   resource: <r>, priority: <p>
+    #   [message: <reason>]
+    #   total sections: <n>, data size: <size>
+    #   <blank>
+
+    packet_type_names = {"A": "Archive", "S": "Stage", "M": "Media", "L": "Library"}
+
+    id_re      = re.compile(r'^ID:\s*(\S+)\s+TYPE:\s*(\S+)')
+    detail_re  = re.compile(r'(?:Archset|Volume|Library):\s*(\S+)')
+    created_re = re.compile(r'^Created:\s+(.+)$')
+    message_re = re.compile(r'^message:\s+(.+)$')
+
+    current_queue = None
+    current_packet = None
+    packets_checked = 0
+    stuck_found = 0
+
+    def _evaluate_packet(pkt):
+        nonlocal nrpe_status, packets_checked, stuck_found
+        packets_checked += 1
+        try:
+            created_t = time.mktime(time.strptime(pkt["created"], SCHEDULER_DATE_FMT))
+        except ValueError as e:
+            debug_print(f"Could not parse Created timestamp '{pkt['created']}': {e}", "VERBOSE")
+            return
+        age = now - created_t
+        age_h = age / 3600
+        ptype_name = packet_type_names.get(pkt['ptype'], pkt['ptype'])
+        label = f"{ptype_name} packet {pkt['id']}"
+        if pkt['detail']:
+            label += f" ({pkt['detail']})"
+        label += f" queued in {pkt['queue']} for {age_h:.1f}h"
+        if pkt['reason']:
+            label += f" - reason: {pkt['reason']}"
+        debug_print(f"Evaluating {label}", "VERBOSE")
+        if age >= crit_secs:
+            pkt_status = "crit"
+            nrpe_status = max(nrpe_status, NRPE_EXIT_CRIT)
+            stuck_found += 1
+        elif age >= warn_secs:
+            pkt_status = "warn"
+            nrpe_status = max(nrpe_status, NRPE_EXIT_WARN)
+            stuck_found += 1
+        else:
+            pkt_status = "ok"
+
+        packets_snapshot.append({
+            "id": pkt['id'],
+            "type": ptype_name,
+            "detail": pkt['detail'],
+            "queue": pkt['queue'],
+            "created_epoch": int(created_t),
+            "created_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created_t)),
+            "reason": pkt['reason'],
+            "age_hours": round(age_h, 2),
+            "status": pkt_status,
+        })
+
+    for line in stdout:
+        line = line.rstrip()
+
+        # Detect queue header (non-indented word, not a dashed separator or packet field)
+        if line and not line.startswith(' ') and not line.startswith('\t') \
+                and not line.startswith('-') and not line.startswith('ID:') \
+                and not line.startswith('Created:') and not line.startswith('resource:') \
+                and not line.startswith('message:') and not line.startswith('total'):
+            current_queue = line.strip()
+            debug_print(f"Entering queue section: {current_queue}", "VERBOSE")
+            current_packet = None
+            continue
+
+        # Only care about stuck queues
+        if current_queue not in STUCK_QUEUE_NAMES:
+            continue
+
+        id_match = id_re.match(line)
+        if id_match:
+            current_packet = {
+                "id": id_match.group(1),
+                "ptype": id_match.group(2),
+                "detail": detail_re.search(line),
+                "queue": current_queue,
+                "created": None,
+                "reason": None,
+            }
+            if current_packet["detail"]:
+                current_packet["detail"] = current_packet["detail"].group(1)
+            continue
+
+        if current_packet is None:
+            continue
+
+        created_match = created_re.match(line)
+        if created_match:
+            current_packet["created"] = created_match.group(1).strip()
+            continue
+
+        message_match = message_re.match(line)
+        if message_match:
+            current_packet["reason"] = message_match.group(1).strip()
+            continue
+
+        # Blank line — packet block complete, evaluate it
+        if line == "" and current_packet.get("created"):
+            pkt = current_packet
+            current_packet = None
+            _evaluate_packet(pkt)
+
+    # Flush final packet if output had no trailing blank line
+    if current_packet and current_packet.get("created"):
+        _evaluate_packet(current_packet)
+
+    # Emit one grouped message per (status, type, detail, queue, reason) combination.
+    # OK packets are suppressed individually — only the end summary is shown.
+    groups = {}
+    for p in packets_snapshot:
+        if p["status"] == "ok":
+            continue
+        key = (p["status"], p["type"], p["detail"], p["queue"], p["reason"])
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(p)
+
+    for (pkt_status, ptype_name, detail, queue, reason), grp in groups.items():
+        count = len(grp)
+        oldest_h = max(p["age_hours"] for p in grp)
+        threshold = args.job_crit if pkt_status == "crit" else args.job_warn
+        prefix = "CRITICAL" if pkt_status == "crit" else "WARN"
+        noun = "packet" if count == 1 else "packets"
+        msg = f"{prefix}: {count} {ptype_name} {noun}"
+        if detail:
+            msg += f" ({detail})"
+        msg += f" queued in {queue}"
+        if count == 1:
+            msg += f" for {oldest_h:.1f}h"
+        else:
+            msg += f", oldest {oldest_h:.1f}h"
+        if reason:
+            msg += f" - reason: {reason}"
+        msg += f" (threshold: {threshold}h)"
+        nrpe_msgs.append(msg)
+
+    if packets_checked == 0:
+        nrpe_msgs.append("OK: No queued packets found in PENDING-Q or WAIT-Q")
+    elif stuck_found == 0 and nrpe_status == NRPE_EXIT_OK:
+        nrpe_msgs.append(f"OK: {packets_checked} queued packet(s) checked, none stuck beyond threshold")
+
+    # Build archset-keyed structure for the state file.
+    # Each archset (e.g. "archive-test.1") is the root key; per-packet fields
+    # that don't vary (type, queue, reason) live at the archset level.
+    # Individual packets carry only the fields that differ: id, age, timestamps, status.
+    status_rank = {"ok": 0, "warn": 1, "crit": 2}
+    archsets = {}
+    for p in packets_snapshot:
+        key = p["detail"] or f"{p['type']}-{p['id']}"
+        if key not in archsets:
+            archsets[key] = {
+                "type": p["type"],
+                "queue": p["queue"],
+                "status": p["status"],
+                "packet_count": 0,
+                "oldest_age_hours": 0.0,
+                "reason": p["reason"],
+                "packets": [],
+            }
+        entry = archsets[key]
+        if status_rank[p["status"]] > status_rank[entry["status"]]:
+            entry["status"] = p["status"]
+        if p["age_hours"] > entry["oldest_age_hours"]:
+            entry["oldest_age_hours"] = p["age_hours"]
+        entry["packet_count"] += 1
+        entry["packets"].append({
+            "id": p["id"],
+            "created_epoch": p["created_epoch"],
+            "created_iso": p["created_iso"],
+            "age_hours": p["age_hours"],
+            "status": p["status"],
+        })
+
+    # Fire one notification per archset on status transitions
+    for key, entry in archsets.items():
+        prev_notified = prev_archsets.get(key, {}).get("notified_status", "ok")
+        curr_status = entry["status"]
+        count = entry["packet_count"]
+        oldest_h = entry["oldest_age_hours"]
+        noun = "packet" if count == 1 else "packets"
+        notify_msg = f"{count} {entry['type']} {noun} ({key}) queued in {entry['queue']}, oldest {oldest_h:.1f}h"
+        if entry["reason"]:
+            notify_msg += f" - reason: {entry['reason']}"
+        if curr_status == "ok":
+            entry["notified_status"] = "ok"
+        elif curr_status == "crit" and prev_notified != "crit":
+            send_notify(notify_msg, 3, now)
+            entry["notified_status"] = "crit"
+            debug_print(f"Archset {key}: transition {prev_notified} -> crit, notified", "VERBOSE")
+        elif curr_status == "warn" and prev_notified == "ok":
+            send_notify(notify_msg, 2, now)
+            entry["notified_status"] = "warn"
+            debug_print(f"Archset {key}: transition ok -> warn, notified", "VERBOSE")
+        else:
+            entry["notified_status"] = prev_notified
+
+    status_label = {NRPE_EXIT_OK: "ok", NRPE_EXIT_WARN: "warn", NRPE_EXIT_CRIT: "crit"}
+    counts = {"ok": 0, "warn": 0, "crit": 0}
+    for p in packets_snapshot:
+        counts[p["status"]] += 1
+
+    save_jobs_state({
+        "generated_at": int(now),
+        "generated_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "hostname": socket.gethostname(),
+        "overall_status": status_label.get(nrpe_status, "ok"),
+        "summary": {
+            "total_packets": len(packets_snapshot),
+            "total_archsets": len(archsets),
+            "ok": counts["ok"],
+            "warn": counts["warn"],
+            "crit": counts["crit"],
+        },
+        "archsets": archsets,
+    })
+
+    return nrpe_status, nrpe_msgs
+
 # Check the state of the scheduler
 def check_scheduler(args):
     nrpe_status = NRPE_EXIT_OK
     nrpe_state = "OK"
     nrpe_msgs = []
 
-    command = [SAMCLI_CMD, "scheduler"]
+    command = [SUDO_CMD, SAMCLI_CMD, "scheduler"]
     error, stdout, ret = cmd(command)
     if ret != 0:
-        nrpe_msgs.append((
-            f"CRITICAL: ScoutAM scheduler check failed: {error}"
-        ))
+        error_str = "; ".join(error) if error else "unknown error"
+        nrpe_msgs.append(f"CRITICAL: ScoutAM scheduler check failed: {error_str}")
         return NRPE_EXIT_CRIT, nrpe_msgs
 
     scheduler = {}
@@ -382,7 +708,7 @@ def check_mounts(args):
     # Get all mounted filesystems
     error, mounts = get_mounts()
     if error is not None:
-        nrpe_msgs.append(f"CRITICAL: ScoutFS check failed: {error}")
+        nrpe_msgs.append(f"CRITICAL: ScoutFS check failed: {'; '.join(error) if error else 'unknown error'}")
         return NRPE_EXIT_CRIT, nrpe_msgs
 
     if not mounts:
@@ -401,11 +727,9 @@ def check_mounts(args):
         if args.mount and mount['mount'] != args.mount:
             continue
 
-        usage = {}
-
         error, usage = get_usage(mount['mount'])
         if error is not None:
-            nrpe_msgs.append(f"CRITICAL: ScoutFS failed to get usage: {error}")
+            nrpe_msgs.append(f"CRITICAL: ScoutFS failed to get usage: {'; '.join(error) if error else 'unknown error'}")
             return NRPE_EXIT_CRIT, nrpe_msgs
 
         hwm_bytes = b2h(usage['hwm_bytes'])
@@ -456,7 +780,7 @@ def check_mounts(args):
             nrpe_msgs.append((
                 f"OK: ScoutFS filesystem {mount['mount']} metadata used {meta_used}, ",
                 f"free: {meta_free}, high watermark: {hwm_bytes}"
-        ))
+            ))
 
         if usage['hwm_exceeded']:
             nrpe_msgs.append((
@@ -474,7 +798,6 @@ def check_gateway(args, gateway="versitygw"):
     name = "VersityGW"
     conf_dir = VERSITYGW_CONF_DIR
     service_prefix = VERSITYGW_SERVICE
-    configs = []
 
     if gateway == "scoutgw":
         name = "ScoutGW"
@@ -491,21 +814,19 @@ def check_gateway(args, gateway="versitygw"):
             return nrpe_status, nrpe_msgs
 
     if not os.path.isdir(conf_dir):
-        return nrpe_status, []
+        nrpe_msgs.append(f"OK: {name} configuration directory {conf_dir} not found, skipping check")
+        return nrpe_status, nrpe_msgs
 
     try:
         configs = [f for f in os.listdir(conf_dir)
             if f.endswith('.conf')]
     except Exception as e:
-        nrpe_msgs.append((
-            f"CRITICAL: {name} cannot access configuration directory ",
-            f"{conf_dir}: {e}"
-        ))
+        nrpe_msgs.append(f"CRITICAL: {name} cannot access configuration directory {conf_dir}: {e}")
+        return NRPE_EXIT_CRIT, nrpe_msgs
 
     if not configs:
-        nrpe_msgs.append(
-            f"WARN: No {name} configurations found in {conf_dir}"
-        )
+        nrpe_msgs.append(f"WARN: No {name} configurations found in {conf_dir}")
+        return NRPE_EXIT_WARN, nrpe_msgs
 
     for conf in configs:
         # Skip example configuration file
@@ -534,7 +855,6 @@ def check_scoutsync(args):
     name = "scoutsync"
     conf_dir = SCOUTSYNC_CONF_DIR
     service_prefix = SCOUTSYNC_SERVICE
-    configs = []
 
     if not shutil.which("scoutsync"):
         nrpe_msgs.append((
@@ -542,21 +862,19 @@ def check_scoutsync(args):
         return nrpe_status, nrpe_msgs
 
     if not os.path.isdir(conf_dir):
-        return nrpe_status, []
+        nrpe_msgs.append(f"OK: {name} configuration directory {conf_dir} not found, skipping check")
+        return nrpe_status, nrpe_msgs
 
     try:
         configs = [f for f in os.listdir(conf_dir)
             if f.endswith('.conf')]
     except Exception as e:
-        nrpe_msgs.append((
-            f"CRITICAL: {name} cannot access configuration directory ",
-            f"{conf_dir}: {e}"
-        ))
+        nrpe_msgs.append(f"CRITICAL: {name} cannot access configuration directory {conf_dir}: {e}")
+        return NRPE_EXIT_CRIT, nrpe_msgs
 
     if not configs:
-        nrpe_msgs.append(
-            f"WARN: No {name} configurations found in {conf_dir}"
-        )
+        nrpe_msgs.append(f"WARN: No {name} configurations found in {conf_dir}")
+        return NRPE_EXIT_WARN, nrpe_msgs
 
     for conf in configs:
         # Skip example configuration file
@@ -587,8 +905,7 @@ def check_scoutam(args):
     status = get_service_status("scoutam")
     if status != "active":
         nrpe_msgs.append("CRITICAL: ScoutAM service is not running")
-        if nrpe_status < NRPE_EXIT_CRIT:
-            nrpe_status = NRPE_EXIT_CRIT
+        nrpe_status = NRPE_EXIT_CRIT
     else:
         nrpe_msgs.append("OK: ScoutAM service is running")
 
@@ -603,7 +920,6 @@ def check_sequences(args):
 
     # Check if this is the scheduler node
     is_scheduler, scheduler_name, error = is_scheduler_node()
-
 
     if error:
         # Could not determine scheduler status - return warning
@@ -629,14 +945,17 @@ def check_sequences(args):
 
     # This is the scheduler node - proceed with sequence check
     # Execute samcli debug seq -c command
-    command = [SAMCLI_CMD, "debug", "seq", "-c"]
+    command = [SUDO_CMD, SAMCLI_CMD, "debug", "seq", "-c"]
     error, stdout, ret = cmd(command)
     if ret != 0:
-        nrpe_msgs.append(f"CRITICAL: Sequence check failed: {error}")
+        nrpe_msgs.append(f"CRITICAL: Sequence check failed: {'; '.join(error) if error else 'unknown error'}")
         return NRPE_EXIT_CRIT, nrpe_msgs
 
     # Join output into single string for multi-line regex
     output = "\n".join(stdout)
+
+    notify_warn_secs = args.seq_notify_warn * 3600
+    notify_crit_secs = args.seq_notify_crit * 3600
 
     # Parse filesystem blocks - each starts with ### FSID
     # Match FSID, Mount, and capture everything until next ### or end
@@ -670,11 +989,11 @@ def check_sequences(args):
         content = fs_match.group("content")
         debug_print(f"Processing filesystem {mount} (FSID: {fsid})", "VERBOSE")
 
+        seen_mounts.add(mount)
+
         # Filter by mount if specified
         if args.mount and mount != args.mount:
             continue
-
-        seen_mounts.add(mount)
 
         # Extract current FS sequence
         current_fs_seq = None
@@ -719,7 +1038,7 @@ def check_sequences(args):
                 # Update reason in case it changed
                 state[mount]["arfind"]["reason"] = reason
 
-            # Check thresholds
+            # Check NRPE thresholds
             if duration >= args.arfind_crit:
                 nrpe_msgs.append((
                     f"CRITICAL: Arfind blocked for {int(duration)}s on {mount} ",
@@ -734,10 +1053,21 @@ def check_sequences(args):
                 nrpe_status = max(nrpe_status, NRPE_EXIT_WARN)
             else:
                 nrpe_msgs.append(f"OK: Arfind blocked for {int(duration)}s on {mount} (under threshold)")
+
+            # Fire ScoutAM notification on first crossing of notify thresholds
+            prev_notified = state[mount]["arfind"].get("notified_status", "ok")
+            if duration >= notify_crit_secs and prev_notified != "crit":
+                send_notify(f"Arfind blocked for {int(duration)}s on {mount} (inode {inode}: {reason})", 3, current_time)
+                state[mount]["arfind"]["notified_status"] = "crit"
+            elif duration >= notify_warn_secs and prev_notified == "ok":
+                send_notify(f"Arfind blocked for {int(duration)}s on {mount} (inode {inode}: {reason})", 2, current_time)
+                state[mount]["arfind"]["notified_status"] = "warn"
         elif arfind_not_blocked_regex.search(content):
-            # Arfind not blocked
             state[mount]["arfind"] = {"status": "not_blocked"}
             nrpe_msgs.append(f"OK: Arfind not blocked on {mount}")
+        else:
+            nrpe_msgs.append(f"WARN: Arfind status not found in sequence output for {mount}")
+            nrpe_status = max(nrpe_status, NRPE_EXIT_WARN)
 
         # Check Stfind status
         stfind_blocked = stfind_blocked_regex.search(content)
@@ -761,7 +1091,7 @@ def check_sequences(args):
                 # Update reason in case it changed
                 state[mount]["stfind"]["reason"] = reason
 
-            # Check thresholds
+            # Check NRPE thresholds
             if duration >= args.stfind_crit:
                 nrpe_msgs.append((
                     f"CRITICAL: Stfind blocked for {int(duration)}s on {mount} ",
@@ -776,10 +1106,21 @@ def check_sequences(args):
                 nrpe_status = max(nrpe_status, NRPE_EXIT_WARN)
             else:
                 nrpe_msgs.append(f"OK: Stfind blocked for {int(duration)}s on {mount} (under threshold)")
+
+            # Fire ScoutAM notification on first crossing of notify thresholds
+            prev_notified = state[mount]["stfind"].get("notified_status", "ok")
+            if duration >= notify_crit_secs and prev_notified != "crit":
+                send_notify(f"Stfind blocked for {int(duration)}s on {mount} (inode {inode}: {reason})", 3, current_time)
+                state[mount]["stfind"]["notified_status"] = "crit"
+            elif duration >= notify_warn_secs and prev_notified == "ok":
+                send_notify(f"Stfind blocked for {int(duration)}s on {mount} (inode {inode}: {reason})", 2, current_time)
+                state[mount]["stfind"]["notified_status"] = "warn"
         elif stfind_not_blocked_regex.search(content):
-            # Stfind not blocked
             state[mount]["stfind"] = {"status": "not_blocked"}
             nrpe_msgs.append(f"OK: Stfind not blocked on {mount}")
+        else:
+            nrpe_msgs.append(f"WARN: Stfind status not found in sequence output for {mount}")
+            nrpe_status = max(nrpe_status, NRPE_EXIT_WARN)
 
     if not fs_found:
         nrpe_msgs.append("CRITICAL: No filesystems found in sequence output")
@@ -799,25 +1140,47 @@ def parse_args():
     parser = argparse.ArgumentParser(
         usage=(
             "\n"
-            "check_scoutam.py [--help|-h] [--mount|-m MOUNT] [--passfail|-p] operation\n"
+            "check_scoutam.py [--help|-h] [--mount|-m MOUNT] [--passfail|-p] [options] operation\n"
             "\n"
             "Optional arguments:\n"
             "\n"
-            "    --help|-h         Print help message and exit\n"
-            "    --mount|-m MOUNT  Mount point to check\n"
-            "    --passfail|-p     Exit with either a 0 (success), 1 for warning, or 2 for critical\n"
+            "    --help|-h              Print help message and exit\n"
+            "    --mount|-m MOUNT       Mount point to check\n"
+            "    --passfail|-p          Exit with 0 (ok), 1 (warn), or 2 (crit) only, no output\n"
+            "    --verbose|-v           Enable verbose output for troubleshooting\n"
+            "    --debug|-d             Enable debug output (includes command output)\n"
             "\n"
-            "The following check operations are available:\n"
+            "Filesystem usage thresholds (mount operation):\n"
             "\n"
-            "    mount [warn_thresh] [crit_thresh] - check if scoutfs filesystem is mounted\n"
-            "    service     - check if the ScoutAM service is running\n"
-            "    scheduler   - check if the scheduler is running on the leader node\n"
-            "    sequences   - check if Arfind/Stfind restart are blocked (requires threshold args)\n"
-            "    gateway     - check if all the configured ScoutAM S3 gateway services are running\n"
-            "    versitygw   - check if all the configured Versity S3 gateway services are running\n"
-            "    scoutsync   - check if all the configured ScoutAM Sync services are running\n"
-            "    scoutam     - check mount, scoutam, and scheduler\n"
-            "    all         - check all including S3 gateways\n"
+            "    warn_thresh            Data/metadata usage warning percent (default: 70)\n"
+            "    crit_thresh            Data/metadata usage critical percent (default: 90)\n"
+            "\n"
+            "Arfind/Stfind sequence thresholds (sequences operation):\n"
+            "\n"
+            "    --arfind-warn SECS     Arfind NRPE warning threshold in seconds (default: 300)\n"
+            "    --arfind-crit SECS     Arfind NRPE critical threshold in seconds (default: 600)\n"
+            "    --stfind-warn SECS     Stfind NRPE warning threshold in seconds (default: 300)\n"
+            "    --stfind-crit SECS     Stfind NRPE critical threshold in seconds (default: 600)\n"
+            "    --seq-notify-warn HRS  ScoutAM notify warn threshold in hours (default: 2)\n"
+            "    --seq-notify-crit HRS  ScoutAM notify critical threshold in hours (default: 6)\n"
+            "\n"
+            "Stuck job thresholds (jobs operation):\n"
+            "\n"
+            "    --job-warn HRS         PENDING-Q/WAIT-Q warning threshold in hours (default: 5)\n"
+            "    --job-crit HRS         PENDING-Q/WAIT-Q critical threshold in hours (default: 12)\n"
+            "\n"
+            "Operations:\n"
+            "\n"
+            "    mount       Check ScoutFS filesystem usage against warn/crit thresholds\n"
+            "    service     Check if the ScoutAM service is running\n"
+            "    scheduler   Check if the scheduler is running and not idled\n"
+            "    sequences   Check if Arfind/Stfind restart sequences are blocked\n"
+            "    jobs        Check for scheduler packets stuck in PENDING-Q or WAIT-Q\n"
+            "    gateway     Check if all configured ScoutAM S3 gateway instances are running\n"
+            "    versitygw   Check if all configured VersityGW S3 gateway instances are running\n"
+            "    scoutsync   Check if all configured ScoutSync instances are running\n"
+            "    scoutam     Run mount, service, and scheduler checks together\n"
+            "    all         Run all checks including gateways and scoutsync\n"
             "\n"
         ),
         add_help=False
@@ -827,13 +1190,17 @@ def parse_args():
     parser.add_argument("--mount", "-m", type=str)
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output for troubleshooting")
     parser.add_argument("--debug", "-d", action="store_true", help="Enable debug output (includes command output)")
-    parser.add_argument("--arfind-warn", type=int, default=300, help="Arfind warning threshold in seconds (default: 300)")
-    parser.add_argument("--arfind-crit", type=int, default=600, help="Arfind critical threshold in seconds (default: 600)")
-    parser.add_argument("--stfind-warn", type=int, default=300, help="Stfind warning threshold in seconds (default: 300)")
-    parser.add_argument("--stfind-crit", type=int, default=600, help="Stfind critical threshold in seconds (default: 600)")
-    parser.add_argument("operation", choices=["mount", "service", "scheduler", "sequences", "gateway", "versitygw", "scoutam", "scoutsync", "all"])
-    parser.add_argument("crit_thresh", type=int, nargs="?", default=90)
+    parser.add_argument("--arfind-warn", type=int, default=300, help="Arfind NRPE warning threshold in seconds (default: 300)")
+    parser.add_argument("--arfind-crit", type=int, default=600, help="Arfind NRPE critical threshold in seconds (default: 600)")
+    parser.add_argument("--stfind-warn", type=int, default=300, help="Stfind NRPE warning threshold in seconds (default: 300)")
+    parser.add_argument("--stfind-crit", type=int, default=600, help="Stfind NRPE critical threshold in seconds (default: 600)")
+    parser.add_argument("--seq-notify-warn", type=int, default=2, help="Arfind/Stfind notification warning threshold in hours (default: 2)")
+    parser.add_argument("--seq-notify-crit", type=int, default=6, help="Arfind/Stfind notification critical threshold in hours (default: 6)")
+    parser.add_argument("--job-warn", type=int, default=5, help="Stuck job warning threshold in hours (default: 5)")
+    parser.add_argument("--job-crit", type=int, default=12, help="Stuck job critical threshold in hours (default: 12)")
+    parser.add_argument("operation", choices=["mount", "service", "scheduler", "sequences", "jobs", "gateway", "versitygw", "scoutam", "scoutsync", "all"])
     parser.add_argument("warn_thresh", type=int, nargs="?", default=70)
+    parser.add_argument("crit_thresh", type=int, nargs="?", default=90)
 
     return parser.parse_args()
 
@@ -854,11 +1221,11 @@ def main():
         NRPE_EXIT_OK: "ok",
     }
 
-    if not os.path.isfile(SCOUTFS_CMD) and not os.access(SCOUTFS_CMD, os.X_OK):
+    if not os.path.isfile(SCOUTFS_CMD) or not os.access(SCOUTFS_CMD, os.X_OK):
         print("CRITICAL: ScoutFS is not installed or missing binaries")
         sys.exit(NRPE_EXIT_CRIT)
 
-    if not os.path.isfile(SCOUTAM_MONITOR_CMD) and not os.access(SCOUTAM_MONITOR_CMD, os.X_OK):
+    if not os.path.isfile(SCOUTAM_MONITOR_CMD) or not os.access(SCOUTAM_MONITOR_CMD, os.X_OK):
         print("CRITICAL: ScoutAM is not installed or missing binaries")
         sys.exit(NRPE_EXIT_CRIT)
 
@@ -879,6 +1246,11 @@ def main():
 
     if args.operation in {"sequences", "all"}:
         nrpe_status, msgs = check_sequences(args)
+        nrpe_msgs.extend(msgs)
+        nrpe_checks[status_map[nrpe_status]] += 1
+
+    if args.operation in {"jobs", "all"}:
+        nrpe_status, msgs = check_jobs(args)
         nrpe_msgs.extend(msgs)
         nrpe_checks[status_map[nrpe_status]] += 1
 
