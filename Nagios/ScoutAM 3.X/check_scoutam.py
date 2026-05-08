@@ -21,6 +21,9 @@ SCOUTFS_CMD = "/usr/sbin/scoutfs"
 SCOUTAM_MONITOR_CMD = "/usr/sbin/scoutam-monitor"
 SAMCLI_CMD = "/usr/bin/samcli"
 
+# Command to escalate privileges for samcli usage
+SUDO_CMD = "/bin/sudo"
+
 # SystemD services
 SCOUTAM_SERVICE = "scoutam"
 SCOUTFS_FENCED_SERVICE = "scoutfs-fenced"
@@ -36,7 +39,7 @@ SCOUTSYNC_CONF_DIR = "/etc/scoutsync.d"
 # State file for sequence restart monitoring
 STATE_FILE = "/var/lib/nagios/check_scoutam_sequences.json"
 
-# State file for stuck scheduler packet monitoring (read by external tools)
+# State file for stuck scheduler packet monitoring
 JOBS_STATE_FILE = "/var/lib/nagios/check_scoutam_jobs.json"
 
 # Scheduler queues that indicate a stuck/waiting packet
@@ -184,7 +187,7 @@ def get_usage(mount):
             usage[usage_type]["bytes_free"] = usage[usage_type]["blocks_free"] * usage[usage_type]["block_size"]
 
     # Get high and low watermarks
-    command = [SAMCLI_CMD, "fs", "stat", "-m", mount]
+    command = [SUDO_CMD, SAMCLI_CMD, "fs", "stat", "-m", mount]
     error, stdout, ret = cmd(command)
     if ret != 0:
         return error, None
@@ -237,7 +240,7 @@ def is_scheduler_node():
         tuple: (is_scheduler: bool, scheduler_name: str or None, error: str or None)
     """
     # Execute samcli system command
-    command = [SAMCLI_CMD, "system"]
+    command = [SUDO_CMD, SAMCLI_CMD, "system"]
     error, stdout, ret = cmd(command)
 
     if ret != 0:
@@ -348,7 +351,7 @@ def load_jobs_state():
 
 def send_notify(message, severity, timestamp):
     """Send a notification via samcli notify message. Failures are logged as warnings."""
-    command = [SAMCLI_CMD, "notify", "message",
+    command = [SUDO_CMD, SAMCLI_CMD, "notify", "message",
                "--message", message,
                "--severity", str(severity),
                "--timestamp", str(int(timestamp))]
@@ -404,7 +407,7 @@ def check_jobs(args):
     nrpe_msgs = []
     now = time.time()
 
-    command = [SAMCLI_CMD, "scheduler", "--detail"]
+    command = [SUDO_CMD, SAMCLI_CMD, "scheduler", "--detail"]
     error, stdout, ret = cmd(command)
     if ret != 0:
         error_str = "; ".join(error) if error else "unknown error"
@@ -652,7 +655,7 @@ def check_scheduler(args):
     nrpe_state = "OK"
     nrpe_msgs = []
 
-    command = [SAMCLI_CMD, "scheduler"]
+    command = [SUDO_CMD, SAMCLI_CMD, "scheduler"]
     error, stdout, ret = cmd(command)
     if ret != 0:
         error_str = "; ".join(error) if error else "unknown error"
@@ -942,7 +945,7 @@ def check_sequences(args):
 
     # This is the scheduler node - proceed with sequence check
     # Execute samcli debug seq -c command
-    command = [SAMCLI_CMD, "debug", "seq", "-c"]
+    command = [SUDO_CMD, SAMCLI_CMD, "debug", "seq", "-c"]
     error, stdout, ret = cmd(command)
     if ret != 0:
         nrpe_msgs.append(f"CRITICAL: Sequence check failed: {'; '.join(error) if error else 'unknown error'}")
