@@ -46,7 +46,7 @@ STATE_FILE = "/var/lib/nagios/check_scoutam_sequences.json"
 JOBS_STATE_FILE = "/var/lib/nagios/check_scoutam_jobs.json"
 
 # Scheduler queues that indicate a stuck/waiting packet
-STUCK_QUEUE_NAMES = {"RUNNING", "RESERVING", PENDING-Q", "WAIT-Q"}
+STUCK_QUEUE_NAMES = {"RUNNING", "RESERVING", "PENDING-Q", "WAIT-Q"}
 
 # Date format used by samcli scheduler --detail
 SCHEDULER_DATE_FMT = "%b %d %H:%M:%S %Z %Y"
