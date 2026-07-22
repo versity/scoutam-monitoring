@@ -104,10 +104,13 @@ ExecStart=/mnt/admin/software/prometheus/statsd_exporter/statsd_exporter
 
 [Install]
 WantedBy=multi-user.target
+```
 
-Node Exporter Configuration
+## Node Exporter Configuration
+
 The standard Node Exporter configuration can be used. An example SystemD service:
 
+```
 [Unit]
 Description=Prometheus node exporter
 After=network.target
