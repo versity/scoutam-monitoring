@@ -37,6 +37,14 @@ SCOUTSYNC_CONF_DIR="/etc/scoutsync.d"
 # State file for sequence restart monitoring
 STATE_FILE="/var/lib/nagios/check_scoutam_sequences.json"
 
+# Cache file for 'samcli debug tracker -a' output, used to disambiguate a
+# blocked Arfind/Stfind restart (expected serialization on a real in-progress
+# job vs. a genuinely stuck file). Archiving a large (100+GiB) file can take
+# a long time, and Nagios checks typically run every 1-5 minutes, so this is
+# cached across separate check invocations rather than re-run every poll.
+TRACKER_CACHE_FILE="/var/lib/nagios/check_scoutam_tracker_cache.json"
+TRACKER_CACHE_SECS=300  # 5 minutes
+
 # NRPE exit status
 NRPE_EXIT_OK = 0
 NRPE_EXIT_WARN = 1
@@ -117,6 +125,131 @@ def cmd(command, timeout=30):
         debug_print(f"Command failed with return code: {e.returncode}", "DEBUG")
         stderr = e.stderr.splitlines() if e.stderr else []
         return stderr, [], e.returncode
+
+def load_tracker_cache():
+    """Load cached tracker state from JSON file with file locking, return None if missing/corrupt."""
+    if not os.path.exists(TRACKER_CACHE_FILE):
+        return None
+
+    try:
+        with open(TRACKER_CACHE_FILE, 'r') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                return json.load(f)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except (json.JSONDecodeError, IOError) as e:
+        debug_print(f"Tracker cache file corrupt or unreadable, ignoring: {e}", "VERBOSE")
+        return None
+
+def save_tracker_cache(data):
+    """Save tracker cache dict to JSON file with atomic write and file locking."""
+    cache_dir = os.path.dirname(TRACKER_CACHE_FILE)
+    if cache_dir and not os.path.exists(cache_dir):
+        try:
+            os.makedirs(cache_dir, mode=0o750)
+        except OSError as e:
+            print(f"WARN: Could not create cache directory {cache_dir}: {e}", file=sys.stderr)
+            return
+
+    temp_file = TRACKER_CACHE_FILE + ".tmp"
+    try:
+        with open(temp_file, 'w') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                json.dump(data, f, indent=2)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+        os.chmod(temp_file, 0o640)
+        os.rename(temp_file, TRACKER_CACHE_FILE)
+    except (IOError, OSError) as e:
+        print(f"WARN: Could not save tracker cache file {TRACKER_CACHE_FILE}: {e}", file=sys.stderr)
+        if os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+            except OSError:
+                pass
+
+def get_inflight_inodes(max_age=TRACKER_CACHE_SECS):
+    """Return (archive_inflight, stage_inflight, error, from_cache), cached on disk for
+    max_age seconds. Pass max_age=0 to force a fresh fetch, bypassing the cache.
+
+    Backed by 'samcli debug tracker -a'. archive_inflight / stage_inflight are sets of
+    (fsid, inode) tuples, both strings, covering everything the tracker currently
+    considers actively in progress:
+      - Archive Copies Started With Sections Still In Progress
+      - Archive Copies In Flight
+      - Stage Files In Flight
+
+    A blocked Arfind/Stfind restart sequence whose inode appears here is expected,
+    self-resolving serialization (the checkpoint can't advance past a copy that is
+    genuinely still running) - not a stuck file. An inode absent from here despite
+    being reported blocked has nothing actively working it and will not resolve on
+    its own.
+
+    Archiving a large file can take a long time and this command's output can be
+    sizable, so the result is cached on disk (shared across separate check
+    invocations - each Nagios poll is a fresh process) rather than fetched fresh
+    on every check run. A cached snapshot showing an inode as in-flight stays
+    trustworthy for its whole max_age window (once queued, a copy doesn't
+    normally un-queue itself). A cached snapshot NOT showing an inode is the
+    risky direction though - the inode may simply have started archiving after
+    the snapshot was taken - so callers about to escalate on an "absent"
+    result should re-check with max_age=0 before trusting it (see
+    check_sequences()).
+    """
+    now = time.time()
+    cached = load_tracker_cache()
+    if cached is not None:
+        age = now - cached.get("timestamp", 0)
+        if age < max_age:
+            debug_print(f"Using cached tracker state ({int(age)}s old, max_age={max_age}s)", "VERBOSE")
+            archive_inflight = {tuple(pair) for pair in cached.get("archive", [])}
+            stage_inflight = {tuple(pair) for pair in cached.get("stage", [])}
+            return archive_inflight, stage_inflight, None, True
+        debug_print(f"Tracker cache stale ({int(age)}s old, max_age={max_age}s), refreshing", "VERBOSE")
+
+    command = [SAMCLI_CMD, "debug", "tracker", "-a"]
+    error, stdout, ret = cmd(command)
+    if ret != 0:
+        return set(), set(), error, False
+
+    archive_inflight = set()
+    stage_inflight = set()
+    section = None
+
+    for line in stdout:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("Archive Copies Started With Sections Still In Progress") or \
+           stripped.startswith("Archive Copies In Flight"):
+            section = "archive"
+            continue
+        if stripped.startswith("Stage Files In Flight"):
+            section = "stage"
+            continue
+
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        fsid, inode = parts[0].strip(), parts[1].strip()
+        if fsid == "FSID":
+            # column header row
+            continue
+        if section == "archive":
+            archive_inflight.add((fsid, inode))
+        elif section == "stage":
+            stage_inflight.add((fsid, inode))
+
+    save_tracker_cache({
+        "timestamp": now,
+        "archive": [list(pair) for pair in archive_inflight],
+        "stage": [list(pair) for pair in stage_inflight],
+    })
+
+    return archive_inflight, stage_inflight, None, False
 
 def get_mounts():
     command = [SCOUTAM_MONITOR_CMD, "-print"]
@@ -594,6 +727,65 @@ def check_scoutam(args):
 
     return nrpe_status, nrpe_msgs
 
+def evaluate_block(label, action_ing, action_ed, mount, inode, reason, duration, in_flight, tracker_error, warn_thresh, crit_thresh):
+    """Decide severity + message for a blocked Arfind/Stfind restart sequence.
+
+    label: "Arfind" or "Stfind", for messages.
+    action_ing/action_ed: "archiving"/"archived" or "staging"/"staged", for messages.
+    in_flight: whether the blocking inode is present in the tracker (i.e. a real
+        job is actively working it right now - see resolve_in_flight()).
+    warn_thresh/crit_thresh: the existing --arfind-warn/-crit (or --stfind-warn/-crit)
+        thresholds, reused for both paths below rather than adding new flags:
+
+      in_flight=True  (queued/in progress - large files can legitimately take a
+      long time, this is expected serialization, not a stuck file):
+        - duration >= crit_thresh -> WARNING is not enough, still queued this
+          long is worth a CRITICAL heads-up (e.g. a job wedged on a faulty drive)
+        - duration >= warn_thresh -> WARNING
+        - otherwise                -> OK
+
+      in_flight=False (nothing is working this inode - it will not resolve on
+      its own, so don't wait out the full duration-based thresholds before
+      alerting; escalate on an accelerated, halved version of the same
+      thresholds instead):
+        - duration >= warn_thresh     -> CRITICAL
+        - duration >= warn_thresh / 2 -> WARNING
+        - otherwise                    -> OK (brief grace period)
+
+    Returns (nrpe_status, message) where message is a 2-tuple, joined by the
+    caller the same way as every other message in this script.
+    """
+    suffix = " [tracker check failed, alerting on duration only]" if tracker_error else ""
+
+    if in_flight:
+        if duration >= crit_thresh:
+            return NRPE_EXIT_CRIT, (
+                f"CRITICAL: {label} blocked for {int(duration)}s on {mount} ",
+                f"(inode {inode}: {reason}) - queued/in tracker but still blocked past {crit_thresh}s{suffix}"
+            )
+        if duration >= warn_thresh:
+            return NRPE_EXIT_WARN, (
+                f"WARN: {label} blocked for {int(duration)}s on {mount} ",
+                f"(inode {inode}: {reason}) - queued/in tracker, taking a while{suffix}"
+            )
+        return NRPE_EXIT_OK, (
+            f"OK: {label} blocked for {int(duration)}s on {mount} ",
+            f"(inode {inode}: {reason}) - actively {action_ing}, in tracker"
+        )
+
+    half_warn = warn_thresh / 2
+    if duration >= warn_thresh:
+        return NRPE_EXIT_CRIT, (
+            f"CRITICAL: {label} blocked for {int(duration)}s on {mount} ",
+            f"(inode {inode}: {reason}) - not in tracker, not being {action_ed}{suffix}"
+        )
+    if duration >= half_warn:
+        return NRPE_EXIT_WARN, (
+            f"WARN: {label} blocked for {int(duration)}s on {mount} ",
+            f"(inode {inode}: {reason}) - not in tracker, not being {action_ed}{suffix}"
+        )
+    return NRPE_EXIT_OK, f"OK: {label} blocked for {int(duration)}s on {mount} (under threshold, not yet in tracker)"
+
 # Check sequence restart status for Arfind and Stfind
 def check_sequences(args):
     debug_print("Starting sequence restart check", "VERBOSE")
@@ -661,6 +853,51 @@ def check_sequences(args):
     # Track which mounts we've seen (to clean up stale entries)
     seen_mounts = set()
 
+    # Lazily fetched once per run, only if a blocked inode is actually seen below -
+    # avoids the extra 'samcli debug tracker -a' call on the common case where
+    # nothing is blocked.
+    inflight_state = {"fetched": False, "archive": set(), "stage": set(), "error": None}
+
+    def load_inflight(max_age):
+        archive_set, stage_set, tracker_error, from_cache = get_inflight_inodes(max_age=max_age)
+        inflight_state["archive"] = archive_set
+        inflight_state["stage"] = stage_set
+        inflight_state["error"] = tracker_error
+        inflight_state["from_cache"] = from_cache
+        inflight_state["fetched"] = True
+        if tracker_error:
+            debug_print(f"Could not fetch in-flight tracker state: {tracker_error}", "VERBOSE")
+
+    def resolve_in_flight(fsid, inode, kind):
+        """Return (in_flight: bool, tracker_error) for (fsid, inode) in the 'archive'
+        or 'stage' tracker set.
+
+        A cached snapshot saying an inode IS in-flight is trusted as-is. A cached
+        snapshot saying it is NOT in-flight is not trusted on its own - the inode
+        may simply have entered the tracker after the snapshot was taken - so that
+        case forces one fresh, uncached lookup before it's used to escalate an
+        alert. This only costs an extra 'samcli debug tracker -a' call in the rare
+        case where a blocked inode is actually about to be reported, not on every
+        check run.
+        """
+        if not inflight_state["fetched"]:
+            load_inflight(args.tracker_cache_secs)
+
+        target = inflight_state["archive"] if kind == "archive" else inflight_state["stage"]
+        in_flight = (fsid, inode) in target
+
+        if not in_flight and inflight_state["from_cache"] and not inflight_state["error"]:
+            debug_print(
+                f"Inode {inode} absent from cached tracker snapshot; forcing a fresh "
+                f"check before treating it as stuck",
+                "VERBOSE"
+            )
+            load_inflight(0)  # max_age=0 forces a fresh, uncached fetch
+            target = inflight_state["archive"] if kind == "archive" else inflight_state["stage"]
+            in_flight = (fsid, inode) in target
+
+        return in_flight, inflight_state["error"]
+
     # Process each filesystem
     fs_found = False
     for fs_match in fs_regex.finditer(output):
@@ -719,21 +956,17 @@ def check_sequences(args):
                 # Update reason in case it changed
                 state[mount]["arfind"]["reason"] = reason
 
-            # Check thresholds
-            if duration >= args.arfind_crit:
-                nrpe_msgs.append((
-                    f"CRITICAL: Arfind blocked for {int(duration)}s on {mount} ",
-                    f"(inode {inode}: {reason})"
-                ))
-                nrpe_status = max(nrpe_status, NRPE_EXIT_CRIT)
-            elif duration >= args.arfind_warn:
-                nrpe_msgs.append((
-                    f"WARN: Arfind blocked for {int(duration)}s on {mount} ",
-                    f"(inode {inode}: {reason})"
-                ))
-                nrpe_status = max(nrpe_status, NRPE_EXIT_WARN)
-            else:
-                nrpe_msgs.append(f"OK: Arfind blocked for {int(duration)}s on {mount} (under threshold)")
+            # A blocked inode that is actively being worked by an archive job
+            # (i.e. present in the tracker) is expected serialization, not a
+            # stuck file - it will clear on its own once that job completes.
+            # See evaluate_block() for the full severity table.
+            in_flight, tracker_error = resolve_in_flight(fsid, inode, "archive")
+            block_status, block_msg = evaluate_block(
+                "Arfind", "archiving", "archived", mount, inode, reason, duration,
+                in_flight, tracker_error, args.arfind_warn, args.arfind_crit
+            )
+            nrpe_msgs.append(block_msg)
+            nrpe_status = max(nrpe_status, block_status)
         elif arfind_not_blocked_regex.search(content):
             # Arfind not blocked
             state[mount]["arfind"] = {"status": "not_blocked"}
@@ -761,21 +994,16 @@ def check_sequences(args):
                 # Update reason in case it changed
                 state[mount]["stfind"]["reason"] = reason
 
-            # Check thresholds
-            if duration >= args.stfind_crit:
-                nrpe_msgs.append((
-                    f"CRITICAL: Stfind blocked for {int(duration)}s on {mount} ",
-                    f"(inode {inode}: {reason})"
-                ))
-                nrpe_status = max(nrpe_status, NRPE_EXIT_CRIT)
-            elif duration >= args.stfind_warn:
-                nrpe_msgs.append((
-                    f"WARN: Stfind blocked for {int(duration)}s on {mount} ",
-                    f"(inode {inode}: {reason})"
-                ))
-                nrpe_status = max(nrpe_status, NRPE_EXIT_WARN)
-            else:
-                nrpe_msgs.append(f"OK: Stfind blocked for {int(duration)}s on {mount} (under threshold)")
+            # Same reasoning as Arfind above: a blocked inode actively being
+            # staged (present in the tracker) is expected serialization, not
+            # a stuck file.
+            in_flight, tracker_error = resolve_in_flight(fsid, inode, "stage")
+            block_status, block_msg = evaluate_block(
+                "Stfind", "staging", "staged", mount, inode, reason, duration,
+                in_flight, tracker_error, args.stfind_warn, args.stfind_crit
+            )
+            nrpe_msgs.append(block_msg)
+            nrpe_status = max(nrpe_status, block_status)
         elif stfind_not_blocked_regex.search(content):
             # Stfind not blocked
             state[mount]["stfind"] = {"status": "not_blocked"}
@@ -831,6 +1059,10 @@ def parse_args():
     parser.add_argument("--arfind-crit", type=int, default=600, help="Arfind critical threshold in seconds (default: 600)")
     parser.add_argument("--stfind-warn", type=int, default=300, help="Stfind warning threshold in seconds (default: 300)")
     parser.add_argument("--stfind-crit", type=int, default=600, help="Stfind critical threshold in seconds (default: 600)")
+    parser.add_argument("--tracker-cache-secs", type=int, default=TRACKER_CACHE_SECS,
+                         help=f"How long to reuse cached 'samcli debug tracker -a' output when "
+                              f"disambiguating a blocked Arfind/Stfind inode, in seconds "
+                              f"(default: {TRACKER_CACHE_SECS})")
     parser.add_argument("operation", choices=["mount", "service", "scheduler", "sequences", "gateway", "versitygw", "scoutam", "scoutsync", "all"])
     parser.add_argument("crit_thresh", type=int, nargs="?", default=90)
     parser.add_argument("warn_thresh", type=int, nargs="?", default=70)
