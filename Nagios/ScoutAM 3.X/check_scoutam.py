@@ -34,6 +34,9 @@ SCOUTGW_CONF_DIR="/etc/scoutgw.d"
 MULTIFS_CONF="/etc/scoutam/multifs.yaml"
 SCOUTSYNC_CONF_DIR="/etc/scoutsync.d"
 
+# Pattern matching example/sample configuration files to be skipped
+EXAMPLE_CONF_RE = re.compile(r"^example.*\.conf$")
+
 # State file for sequence restart monitoring
 STATE_FILE="/var/lib/nagios/check_scoutam_sequences.json"
 
@@ -508,8 +511,8 @@ def check_gateway(args, gateway="versitygw"):
         )
 
     for conf in configs:
-        # Skip example configuration file
-        if conf == "example.conf":
+        # Skip example configuration files (example.conf, example-iam.conf, ...)
+        if EXAMPLE_CONF_RE.match(conf):
             continue
 
         base = os.path.splitext(conf)[0]
@@ -559,8 +562,8 @@ def check_scoutsync(args):
         )
 
     for conf in configs:
-        # Skip example configuration file
-        if conf.startswith("example"):
+        # Skip example configuration files (example.conf, example-iam.conf, ...)
+        if EXAMPLE_CONF_RE.match(conf):
             continue
 
         base = os.path.splitext(conf)[0]
